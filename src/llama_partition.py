@@ -1,6 +1,5 @@
 import logging
 from typing import Optional, Tuple
-from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -10,97 +9,6 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from .utils import default_position_ids
 
 logger = logging.getLogger(__name__)
-
-
-class QuantType(Enum):
-    NONE = 0
-    INT8 = 1  # 8-bit as in the LLM.int8() paper
-    NF4 = 2  # 4-bit as in the QLoRA paper
-
-
-def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
-    """
-    Quantize a model module by replacing Linear layers with quantized versions.
-    This is based on the original Petals implementation.
-    
-    Args:
-        model: The model module to quantize
-        quant_type: Type of quantization (INT8 or NF4)
-    
-    Returns:
-        The quantized model (modified in-place)
-    """
-    # Import bitsandbytes only when necessary
-    try:
-        import bitsandbytes as bnb
-    except ImportError:
-        raise ImportError(
-            "bitsandbytes is required for quantization. "
-            "Install it with: pip install bitsandbytes"
-        )
-
-    quantized_in_this_call = []
-    
-    for n, module in model.named_children():
-        if len(list(module.children())) > 0:
-            quantize_module(module, quant_type=quant_type)
-
-        # Skip critical projection layers used for KV cache correctness
-        # q_proj / k_proj / v_proj / o_proj must stay in higher precision
-        # TODO: Temporarily allowing attention quantization for testing - can revert if issues occur
-        skip_names = {"lm_head", "score"}  # , "q_proj", "k_proj", "v_proj", "o_proj"}  # Commented out to enable attention quantization
-
-        if isinstance(module, torch.nn.Linear) and n not in skip_names:
-            # Ensure the module is on CPU before quantization
-            # Note: We load the model on CPU initially, so this should already be on CPU
-            if module.weight.device.type != "cpu":
-                # If somehow on GPU, move to CPU first
-                logger.warning(
-                    f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
-                )
-                # Move the actual module in the model
-                model._modules[n] = module.cpu()
-                module = model._modules[n]
-            
-            if quant_type == QuantType.INT8:
-                model._modules[n] = bnb.nn.Linear8bitLt(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    has_fp16_weights=False,
-                    threshold=6.0,  # Default from the LLM.int8() paper
-                )
-                model._modules[n].weight = bnb.nn.Int8Params(
-                    module.weight.data, requires_grad=False, has_fp16_weights=False
-                ).to(module.weight.dtype)
-            elif quant_type == QuantType.NF4:
-                compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
-                model._modules[n].weight = bnb.nn.Params4bit(
-                    module.weight.data,
-                    requires_grad=False,
-                    quant_type="nf4",
-                    blocksize=64,
-                    compress_statistics=compress_statistics,
-                ).to(module.weight.dtype)
-            else:
-                raise ValueError(f"Unsupported quant_type='{quant_type}'")
-            model._modules[n].bias = module.bias
-            quantized_in_this_call.append(n)
-    
-    # Log quantization summary (only for top-level calls to avoid duplicates)
-    if quantized_in_this_call and len(list(model.named_children())) > 5:  # Heuristic: top-level if many children
-        logger.info(
-            f"Quantization applied: {len(quantized_in_this_call)} Linear layers quantized to {quant_type.name}"
-        )
-        logger.debug(f"Quantized layer names: {quantized_in_this_call[:10]}{'...' if len(quantized_in_this_call) > 10 else ''}")
-    
-    return model
 
 # Prefer petals optimized block (uses rotary_emb cache) when available
 try:
@@ -117,125 +25,27 @@ except Exception:
     Cache, DynamicCache = None, None
 
 
-def _has_quantized_layers(layer: nn.Module) -> bool:
-    """
-    Check if a layer contains quantized Linear layers (bitsandbytes).
-    """
-    try:
-        import bitsandbytes as bnb
-    except ImportError:
-        return False
-    
-    for module in layer.modules():
-        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
-            return True
-    return False
-
-
-def _count_quantized_modules(layer: nn.Module) -> dict:
-    """Count quantized modules in a layer."""
-    try:
-        import bitsandbytes as bnb
-    except ImportError:
-        return {"int8": 0, "nf4": 0, "total": 0}
-    
-    int8_count = 0
-    nf4_count = 0
-    
-    for module in layer.modules():
-        if isinstance(module, bnb.nn.Linear8bitLt):
-            int8_count += 1
-        elif isinstance(module, bnb.nn.LinearNF4):
-            nf4_count += 1
-    
-    return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
-
-
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     """
     Convert HF layers to OptimizedLlamaDecoderLayer if available.
     Otherwise keep as-is to stay close to HF reference.
-    
-    For quantized layers, copy modules directly instead of using load_state_dict
-    to avoid shape mismatch issues with quantized weight formats.
     """
     converted = []
-    quantized_converted = 0
-    non_quantized_converted = 0
-    already_optimized = 0
-    
     for idx, layer in enumerate(raw_layers):
         if OPT_AVAILABLE:
             if isinstance(layer, OptimizedLlamaDecoderLayer):
                 converted.append(layer)
-                already_optimized += 1
                 continue
-            
             if isinstance(layer, LlamaDecoderLayer):
-                if _has_quantized_layers(layer):
-                    # For quantized layers, create OptimizedLlamaDecoderLayer and copy modules directly
-                    # to avoid shape mismatch from load_state_dict
-                    try:
-                        opt_layer = OptimizedLlamaDecoderLayer(config)
-                        orig_attn = layer.self_attn
-                        opt_attn = opt_layer.self_attn
-                        
-                        # Copy attention projection layers (q_proj, k_proj, v_proj, o_proj)
-                        # These are not quantized (excluded from quantization), so safe to copy
-                        for proj_name in ['q_proj', 'k_proj', 'v_proj', 'o_proj']:
-                            if hasattr(orig_attn, proj_name) and hasattr(opt_attn, proj_name):
-                                orig_proj = getattr(orig_attn, proj_name)
-                                setattr(opt_attn, proj_name, orig_proj)
-                        
-                        # Copy rotary embedding (if exists)
-                        if hasattr(orig_attn, 'rotary_emb') and hasattr(opt_attn, 'rotary_emb'):
-                            opt_attn.rotary_emb = orig_attn.rotary_emb
-                        
-                        # Copy MLP (may contain quantized layers)
-                        opt_layer.mlp = layer.mlp
-                        
-                        # Copy layernorms (not quantized, safe to copy)
-                        opt_layer.input_layernorm = layer.input_layernorm
-                        opt_layer.post_attention_layernorm = layer.post_attention_layernorm
-                        
-                        # Log quantization status
-                        quant_stats = _count_quantized_modules(opt_layer)
-                        logger.info(
-                            f"Layer {idx}: converted quantized layer to OptimizedLlamaDecoderLayer "
-                            f"(quantized modules: {quant_stats['total']} total, "
-                            f"{quant_stats['int8']} INT8, {quant_stats['nf4']} NF4)"
-                        )
-                        converted.append(opt_layer)
-                        quantized_converted += 1
-                        continue
-                    except Exception as e:
-                        logger.warning(
-                            f"Layer {idx}: failed to convert quantized layer to OptimizedLlamaDecoderLayer: {e}. "
-                            "Keeping original layer."
-                        )
-                        converted.append(layer)
-                        continue
-                else:
-                    # Non-quantized: use standard conversion with load_state_dict
-                    opt_layer = OptimizedLlamaDecoderLayer(config)
-                    missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
-                    if missing or unexpected:
-                        logger.warning(
-                            f"Layer {idx}: optimized load missing={len(missing)}, unexpected={len(unexpected)}"
-                        )
-                    converted.append(opt_layer)
-                    non_quantized_converted += 1
-                    continue
+                opt_layer = OptimizedLlamaDecoderLayer(config)
+                missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
+                if missing or unexpected:
+                    logger.warning(
+                        f"Layer {idx}: optimized load missing={len(missing)}, unexpected={len(unexpected)}"
+                    )
+                converted.append(opt_layer)
+                continue
         converted.append(layer)
-    
-    # Log conversion summary
-    if quantized_converted > 0 or non_quantized_converted > 0:
-        logger.info(
-            f"Layer conversion summary: {quantized_converted} quantized layers converted, "
-            f"{non_quantized_converted} non-quantized layers converted, "
-            f"{already_optimized} already optimized"
-        )
-    
     return nn.ModuleList(converted)
 
 
@@ -284,20 +94,7 @@ class Stage0(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
-        
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
-        else:
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized"
-            )
+        logger.info(f"Stage0 initialized with {len(self.layers)} layers (end={end})")
 
     def forward(
         self,
@@ -316,8 +113,6 @@ class Stage0(nn.Module):
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
             out = layer(
                 x,
                 attention_mask=None,
@@ -326,41 +121,15 @@ class Stage0(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
-            
-            # Validate output structure
-            if not isinstance(out, (tuple, list)) or len(out) == 0:
-                raise RuntimeError(f"Stage0: layer {i} returned invalid output: {type(out)}")
-            
             x = out[0]
             if use_cache:
-                if len(out) < 2:
-                    logger.error(
-                        f"Stage0: layer {i} output too short for use_cache=True "
-                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
-                    )
-                    present = None
-                else:
-                    present = out[-1]  # Last element should be past_key_value
-                    present = _from_cache(present)
-            
-            if use_cache:
-                # Check if layer returned KV cache
-                if present is None:
-                    logger.warning(
-                        f"Stage0: layer {i} returned no KV cache "
-                        f"(layer_type={type(layer).__name__}, quantized={_has_quantized_layers(layer)})"
-                    )
-                elif isinstance(present, (tuple, list)) and len(present) == 2:
-                    if present[0] is None or present[1] is None:
-                        logger.warning(
-                            f"Stage0: layer {i} KV cache contains None "
-                            f"(key={present[0] is not None}, value={present[1] is not None})"
-                        )
-                else:
-                    logger.debug(
-                        f"Stage0: layer {i} KV cache format: {type(present)}, "
-                        f"len={len(present) if isinstance(present, (tuple, list)) else 'N/A'}"
-                    )
+                present = out[-1] if len(out) > 1 else None
+                present = _from_cache(present)
+                # if present is None:
+                #     logger.warning(f"Stage0: layer {i} returned no KV cache")
+                # else:
+                #     cache_len = present[0].shape[-2] if isinstance(present, tuple) else "cache_obj"
+                #     logger.info(f"Stage0 layer {i} present cache_len={cache_len}")
                 tuple_cache.append(present)
 
         if not use_cache:
@@ -371,7 +140,9 @@ class Stage0(nn.Module):
 class StageSegment(nn.Module):
     """LLaMA-only middle segment; keep Cache end-to-end."""
 
-    def __init__(self, full, start: int, end: int):
+    def __init__(self, full, start: int, end: int, 
+                 gpu_device: Optional[torch.device] = None,
+                 keep_layers_on_gpu: int = 0):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
         if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
@@ -386,22 +157,67 @@ class StageSegment(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
+        
+        # GPU device 설정
+        self.gpu_device = gpu_device if gpu_device is not None else torch.device("cuda:0")
+        self.cpu_device = torch.device("cpu")
+        self.keep_layers_on_gpu = keep_layers_on_gpu
+        
+        # 레이어들의 현재 device 추적
+        self._layer_devices = {}  # {layer_idx: device}
+        
+        # 초기화: 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
+        for i, layer in enumerate(self.layers):
+            # PyTorch 모듈의 device 확인: 첫 번째 파라미터의 device 사용
+            try:
+                layer_device = next(layer.parameters()).device
+            except StopIteration:
+                # 파라미터가 없는 경우 (거의 없지만) 기본값으로 CPU 가정
+                layer_device = self.cpu_device
+            
+            if layer_device.type != "cpu":
+                self.layers[i] = layer.to(self.cpu_device)
+            self._layer_devices[i] = self.cpu_device
+        
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
-            # Log layer status
-            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-                logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-                )
-            else:
-                logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized"
-                )
+            logger.info(f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}), "
+                       f"lazy GPU loading enabled (keep {keep_layers_on_gpu} layers on GPU)")
+    
+    def _move_layer_to_gpu(self, layer_idx: int):
+        """레이어를 GPU로 이동"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        layer = self.layers[layer_idx]
+        if self._layer_devices.get(layer_idx) != self.gpu_device:
+            try:
+                layer = layer.to(self.gpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.gpu_device
+            except RuntimeError as e:
+                # GPU 메모리 부족 시 CPU에서 실행하도록 fallback
+                logger.warning(f"Failed to move layer {layer_idx} to GPU: {e}, keeping on CPU")
+                self._layer_devices[layer_idx] = self.cpu_device
+    
+    def _move_layer_to_cpu(self, layer_idx: int):
+        """레이어를 CPU로 이동 (keep_layers_on_gpu 설정 고려)"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        # 최근 N개 레이어는 GPU에 유지
+        if self.keep_layers_on_gpu > 0:
+            total_layers = len(self.layers)
+            if layer_idx >= total_layers - self.keep_layers_on_gpu:
+                return  # GPU에 유지
+        
+        layer = self.layers[layer_idx]
+        if self._layer_devices.get(layer_idx) != self.cpu_device:
+            try:
+                layer = layer.to(self.cpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.cpu_device
+            except Exception as e:
+                logger.warning(f"Failed to move layer {layer_idx} to CPU: {e}")
 
     def forward(
         self,
@@ -415,12 +231,35 @@ class StageSegment(nn.Module):
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
+            # 이전 레이어를 CPU로 이동 (필요한 경우)
+            if i > 0:
+                self._move_layer_to_cpu(i - 1)
+            
+            # 현재 레이어를 GPU로 이동
+            self._move_layer_to_gpu(i)
+            
+            # 레이어의 현재 device 확인
+            layer_device = self._layer_devices.get(i, self.cpu_device)
+            
+            # 입력을 레이어 device에 맞게 이동
+            if layer_device == self.gpu_device:
+                x = x.to(self.gpu_device, non_blocking=True)
+            
             layer_past = None if past_key_values is None else past_key_values[i]
+            
+            # past_key_values도 레이어와 동일한 device로 이동
+            if layer_past is not None and layer_device == self.gpu_device:
+                if isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
+                    key, value = layer_past
+                    layer_past = (
+                        key.to(self.gpu_device, non_blocking=True) if key is not None else None,
+                        value.to(self.gpu_device, non_blocking=True) if value is not None else None
+                    )
+            
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+            
             out = layer(
                 x,
                 attention_mask=None,
@@ -429,36 +268,29 @@ class StageSegment(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
-            
-            # Validate output structure
-            if not isinstance(out, (tuple, list)) or len(out) == 0:
-                raise RuntimeError(f"StageSegment: layer {i} returned invalid output: {type(out)}")
-            
             x = out[0]
+            
             if use_cache:
-                if len(out) < 2:
-                    logger.error(
-                        f"StageSegment: layer {i} output too short for use_cache=True "
-                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
-                    )
-                    present = None
-                else:
-                    present = out[-1]  # Last element should be past_key_value
-                    present = _from_cache(present)
-                
-                # Check if layer returned KV cache
+                present = out[-1] if len(out) > 1 else None
+                present = _from_cache(present)
                 if present is None:
-                    logger.warning(
-                        f"StageSegment: layer {i} returned no KV cache "
-                        f"(layer_type={type(layer).__name__})"
-                    )
-                elif isinstance(present, (tuple, list)) and len(present) == 2:
-                    if present[0] is None or present[1] is None:
-                        logger.warning(
-                            f"StageSegment: layer {i} KV cache contains None "
-                            f"(key={present[0] is not None}, value={present[1] is not None})"
-                        )
+                    logger.warning(f"StageSegment: layer {i} returned no KV cache")
+                # cache도 device 일치 확인 (필요한 경우)
+                if present is not None and layer_device == self.gpu_device:
+                    if isinstance(present, (tuple, list)) and len(present) == 2:
+                        key, value = present
+                        # 다음 레이어가 CPU면 CPU로 이동
+                        if i + 1 < len(self.layers) and self._layer_devices.get(i + 1, self.cpu_device) == self.cpu_device:
+                            present = (
+                                key.to(self.cpu_device, non_blocking=True) if key is not None else None,
+                                value.to(self.cpu_device, non_blocking=True) if value is not None else None
+                            )
                 tuple_cache.append(present)
+        
+        # 마지막 레이어 처리 후, 마지막 N개 레이어는 GPU에 유지
+        # 나머지는 CPU로 이동
+        for i in range(len(self.layers) - self.keep_layers_on_gpu):
+            self._move_layer_to_cpu(i)
 
         if not use_cache:
             return x, None
@@ -468,7 +300,9 @@ class StageSegment(nn.Module):
 class StageLast(nn.Module):
     """LLaMA-only last stage; keep Cache end-to-end."""
 
-    def __init__(self, full, start: int):
+    def __init__(self, full, start: int,
+                 gpu_device: Optional[torch.device] = None,
+                 keep_layers_on_gpu: int = 0):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
         if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
@@ -492,19 +326,67 @@ class StageLast(nn.Module):
         self.lm_head = full.lm_head
         self.config = full.config
         
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
-        else:
-            logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized"
-            )
+        # GPU device 설정
+        self.gpu_device = gpu_device if gpu_device is not None else torch.device("cuda:0")
+        self.cpu_device = torch.device("cpu")
+        self.keep_layers_on_gpu = keep_layers_on_gpu
+        
+        # 레이어들의 현재 device 추적
+        self._layer_devices = {}
+        
+        # 모든 레이어를 CPU에 저장 (이미 CPU에 있으면 그대로 유지)
+        for i, layer in enumerate(self.layers):
+            # PyTorch 모듈의 device 확인: 첫 번째 파라미터의 device 사용
+            try:
+                layer_device = next(layer.parameters()).device
+            except StopIteration:
+                # 파라미터가 없는 경우 (거의 없지만) 기본값으로 CPU 가정
+                layer_device = self.cpu_device
+            
+            if layer_device.type != "cpu":
+                self.layers[i] = layer.to(self.cpu_device)
+            self._layer_devices[i] = self.cpu_device
+        
+        # norm과 lm_head는 항상 GPU에 유지 (작고 자주 사용)
+        if hasattr(self, 'norm') and self.norm is not None:
+            self.norm = self.norm.to(self.gpu_device)
+        if hasattr(self, 'lm_head') and self.lm_head is not None:
+            self.lm_head = self.lm_head.to(self.gpu_device)
+        
+        logger.info(f"StageLast initialized with {len(self.layers)} layers (start={start}), "
+                   f"lazy GPU loading enabled (keep {keep_layers_on_gpu} layers on GPU)")
+    
+    def _move_layer_to_gpu(self, layer_idx: int):
+        """레이어를 GPU로 이동"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        if self._layer_devices.get(layer_idx) != self.gpu_device:
+            try:
+                self.layers[layer_idx] = self.layers[layer_idx].to(self.gpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.gpu_device
+            except RuntimeError as e:
+                # GPU 메모리 부족 시 CPU에서 실행하도록 fallback
+                logger.warning(f"Failed to move layer {layer_idx} to GPU: {e}, keeping on CPU")
+                self._layer_devices[layer_idx] = self.cpu_device
+    
+    def _move_layer_to_cpu(self, layer_idx: int):
+        """레이어를 CPU로 이동 (keep_layers_on_gpu 설정 고려)"""
+        if layer_idx < 0 or layer_idx >= len(self.layers):
+            return
+        
+        # 최근 N개 레이어는 GPU에 유지
+        if self.keep_layers_on_gpu > 0:
+            total_layers = len(self.layers)
+            if layer_idx >= total_layers - self.keep_layers_on_gpu:
+                return  # GPU에 유지
+        
+        if self._layer_devices.get(layer_idx) != self.cpu_device:
+            try:
+                self.layers[layer_idx] = self.layers[layer_idx].to(self.cpu_device, non_blocking=True)
+                self._layer_devices[layer_idx] = self.cpu_device
+            except Exception as e:
+                logger.warning(f"Failed to move layer {layer_idx} to CPU: {e}")
 
     def forward(
         self,
@@ -518,12 +400,35 @@ class StageLast(nn.Module):
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
+            # 이전 레이어를 CPU로 이동 (필요한 경우)
+            if i > 0:
+                self._move_layer_to_cpu(i - 1)
+            
+            # 현재 레이어를 GPU로 이동
+            self._move_layer_to_gpu(i)
+            
+            # 레이어의 현재 device 확인
+            layer_device = self._layer_devices.get(i, self.cpu_device)
+            
+            # 입력을 레이어 device에 맞게 이동
+            if layer_device == self.gpu_device:
+                x = x.to(self.gpu_device, non_blocking=True)
+            
             layer_past = None if past_key_values is None else past_key_values[i]
+            
+            # past_key_values도 레이어와 동일한 device로 이동
+            if layer_past is not None and layer_device == self.gpu_device:
+                if isinstance(layer_past, (tuple, list)) and len(layer_past) == 2:
+                    key, value = layer_past
+                    layer_past = (
+                        key.to(self.gpu_device, non_blocking=True) if key is not None else None,
+                        value.to(self.gpu_device, non_blocking=True) if value is not None else None
+                    )
+            
             layer_pos = position_ids if position_ids is not None else default_position_ids(
                 layer_past, x.shape[1], x.device
             )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+            
             out = layer(
                 x,
                 attention_mask=None,
@@ -532,43 +437,38 @@ class StageLast(nn.Module):
                 use_cache=use_cache,
                 output_attentions=False,
             )
-            
-            # Validate output structure
-            if not isinstance(out, (tuple, list)) or len(out) == 0:
-                raise RuntimeError(f"StageLast: layer {i} returned invalid output: {type(out)}")
-            
             x = out[0]
-            if use_cache:
-                if len(out) < 2:
-                    logger.error(
-                        f"StageLast: layer {i} output too short for use_cache=True "
-                        f"(out_len={len(out)}, expected >= 2, layer_type={type(layer).__name__})"
-                    )
-                    present = None
-                else:
-                    present = out[-1]  # Last element should be past_key_value
-                    present = _from_cache(present)
             
             if use_cache:
-                # Check if layer returned KV cache
+                present = out[-1] if len(out) > 1 else None
+                present = _from_cache(present)
                 if present is None:
-                    logger.warning(
-                        f"StageLast: layer {i} returned no KV cache "
-                        f"(layer_type={type(layer).__name__}, quantized={_has_quantized_layers(layer)})"
-                    )
-                elif isinstance(present, (tuple, list)) and len(present) == 2:
-                    if present[0] is None or present[1] is None:
-                        logger.warning(
-                            f"StageLast: layer {i} KV cache contains None "
-                            f"(key={present[0] is not None}, value={present[1] is not None})"
-                        )
+                    logger.warning(f"StageLast: layer {i} returned no KV cache")
+                # cache도 device 일치 확인 (필요한 경우)
+                if present is not None and layer_device == self.gpu_device:
+                    if isinstance(present, (tuple, list)) and len(present) == 2:
+                        key, value = present
+                        # 다음 레이어가 CPU면 CPU로 이동 (마지막 레이어는 norm/lm_head가 GPU이므로 GPU에 유지)
+                        if i + 1 < len(self.layers) and self._layer_devices.get(i + 1, self.cpu_device) == self.cpu_device:
+                            present = (
+                                key.to(self.cpu_device, non_blocking=True) if key is not None else None,
+                                value.to(self.cpu_device, non_blocking=True) if value is not None else None
+                            )
                 tuple_cache.append(present)
-
+        
+        # 마지막 레이어 처리 후, 마지막 N개 레이어는 GPU에 유지
+        # 나머지는 CPU로 이동
+        for i in range(len(self.layers) - self.keep_layers_on_gpu):
+            self._move_layer_to_cpu(i)
+        
+        # norm과 lm_head는 항상 GPU에 있음
+        x = x.to(self.gpu_device, non_blocking=True)
         x = self.norm(x)
         # Ensure x dtype matches lm_head weight dtype to avoid dtype mismatch
         if hasattr(self.lm_head, 'weight') and self.lm_head.weight is not None:
             x = x.to(dtype=self.lm_head.weight.dtype)
         logits = self.lm_head(x)
+        
         if not use_cache:
             return logits, None
         return logits, tuple(tuple_cache)
@@ -582,7 +482,7 @@ def load_stage_model(
     start: int = 0,
     end: Optional[int] = None,
     dtype=torch.float16,
-    quant_type: QuantType = QuantType.NONE,
+    use_cpu_offload: bool = False,
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -590,27 +490,13 @@ def load_stage_model(
       - 'stage0': keep embeddings + layers[:end], drop head/norm
       - 'segment': keep layers[start:end], drop embeddings/head/norm
       - 'last': keep layers[start:], norm, lm_head
-    quant_type: Quantization type (QuantType.NONE, QuantType.INT8, or QuantType.NF4)
-                If quantization is enabled, model will be loaded on CPU, quantized, then moved to device
+    use_cpu_offload: If True, load model to CPU instead of device (for lazy GPU loading)
     """
-    # Always load model on CPU first (required for quantization, and safe for normal loading)
-    # Try device_map="cpu" first, fallback to manual CPU loading if not supported
-    try:
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map="cpu"  # Explicitly load on CPU for quantization compatibility
-        )
-    except TypeError:
-        # Fallback for older transformers versions that don't support device_map="cpu"
-        logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        full = full.cpu()
+    full = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        low_cpu_mem_usage=True
+    )
     try:
         full.config.use_cache = True
     except Exception:
@@ -650,71 +536,15 @@ def load_stage_model(
         num_layers = len(full.transformer.h)
     else:
         num_layers = -1
-    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}, quant_type={quant_type.name}")
+    logger.info(f"load_stage_model: role={role}, layers={num_layers}, start={start}, end={end}")
     if num_layers == 0:
         raise ValueError(f"Pruned model has 0 layers for role={role} (start={start}, end={end}). Check --splits.")
 
-    # Apply quantization if requested (must be done on CPU before moving to device)
-    if quant_type != QuantType.NONE:
-        logger.info(f"Quantizing model with {quant_type.name}...")
-        # Ensure model is on CPU for quantization
-        if next(full.parameters()).device.type != "cpu":
-            logger.warning("Moving model to CPU for quantization...")
-            full = full.cpu()
-        
-        # Apply quantization
-        full = quantize_module(full, quant_type=quant_type)
-        
-        # Verify quantization was applied
-        try:
-            import bitsandbytes as bnb
-            quantized_modules = []
-            linear_modules = []
-            for name, m in full.named_modules():
-                if isinstance(m, torch.nn.Linear):
-                    linear_modules.append(name)
-                if isinstance(m, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
-                    quantized_modules.append(name)
-            
-            total_quantized = len(quantized_modules)
-            total_linear = len(linear_modules)
-            quant_ratio = (total_quantized / total_linear * 100) if total_linear > 0 else 0
-            
-            logger.info(
-                f"Quantization verification: {total_quantized} quantized Linear layers "
-                f"out of {total_linear} total Linear layers ({quant_ratio:.1f}%)"
-            )
-            if quantized_modules:
-                logger.debug(
-                    f"Quantized modules (first 10): {quantized_modules[:10]}"
-                    f"{'...' if len(quantized_modules) > 10 else ''}"
-                )
-            if linear_modules:
-                non_quantized = [name for name in linear_modules if name not in quantized_modules]
-                logger.debug(
-                    f"Non-quantized Linear modules (first 10): {non_quantized[:10]}"
-                    f"{'...' if len(non_quantized) > 10 else ''}"
-                )
-        except ImportError:
-            pass
-        
-        logger.info(f"Quantization with {quant_type.name} completed")
-
-    # Move model to target device
-    # For quantized models, bitsandbytes handles device placement automatically during forward pass
-    # but we still need to move non-quantized parts (embeddings, norm, lm_head) to device
-    if quant_type != QuantType.NONE:
-        # For quantized models, move to device carefully
-        # Quantized Linear layers will handle device placement during forward pass
-        # But we need to move embeddings and other non-quantized components
-        try:
-            # Move the entire model structure, bitsandbytes will handle quantized layers
-            full = full.to(device)
-        except Exception as e:
-            logger.warning(f"Failed to move quantized model to {device}: {e}. "
-                         "Quantized layers may handle device placement automatically during forward pass.")
+    # CPU 오프로딩 모드면 CPU에 로드, 아니면 기존대로 device에 로드
+    if use_cpu_offload:
+        full = full.to(torch.device("cpu"))
+        logger.info(f"load_stage_model: Model loaded to CPU (lazy GPU loading enabled)")
     else:
-        # Normal model: just move to device
         full = full.to(device)
     
     return full

@@ -64,6 +64,13 @@ def main():
         low_cpu_mem_usage=True,
     )
     
+    p = next(model.parameters())
+    print("First param dtype:", p.dtype, "device:", p.device)
+
+    out_emb = model.get_output_embeddings()
+    print("output emb dtype:", out_emb.weight.dtype, "device:", out_emb.weight.device)
+
+
     if args.use_cpu_offload:
         # CPU 오프로딩 모드: 모델을 CPU에 로드하고 forward 시 필요한 레이어만 GPU로 이동
         model = model.to(torch.device("cpu"))

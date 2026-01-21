@@ -1,28 +1,43 @@
 """
 RPC transport using hivemind P2P for Petals-like distributed inference.
 Uses P2P protobuf handlers for client-side RPC calls.
+
+[Full LB 핵심 변경]
+- routing="stage"  : 기존 mini_petals:stage1/2/3 체인
+- routing="module" : petals:module:<model>:block_* 기반으로 route를 DHT에서 계산해서 호출
+
+[Fix 포함]
+- hivemind DHT.get()의 latest 인자/return 형태 버전 차이 안전 처리 (TypeError 방지)
+- Full LB에서 remote_info에 pin만 해둔 peer도 반드시 connect 시도 (peer table empty 방지)
+- _run_async가 코루틴 내부 예외를 event-loop 에러로 오인해서 재실행하지 않도록 안전화
 """
 import asyncio
 import concurrent.futures
-import socket
 import random
+import socket
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Any, TYPE_CHECKING
 
 import torch
 from hivemind import DHT, PeerID, serialize_torch_tensor, MSGPackSerializer
 from hivemind.compression.serialization import deserialize_torch_tensor
 from hivemind.p2p import P2P
 from hivemind.p2p.p2p_daemon_bindings.control import DEFAULT_MAX_MSG_SIZE, MAX_UNARY_PAYLOAD_SIZE
+
 try:
     from hivemind.p2p.p2p_daemon_bindings.utils import P2PDaemonError, P2PHandlerError
 except ImportError:
-    # Fallback for different hivemind versions
     from hivemind.p2p.p2p_daemon_bindings import P2PDaemonError, P2PHandlerError
+
 from hivemind.proto import runtime_pb2
 from hivemind.utils.asyncio import aiter_with_timeout, iter_as_aiter
 from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import split_for_streaming
+
+from .dht_utils import get_module_key
+
+if TYPE_CHECKING:
+    from multiaddr import Multiaddr
 
 logger = get_logger(__name__)
 
@@ -42,16 +57,26 @@ class RpcTransport:
         top_p: float = 0.92,
         top_k: int = 50,
         stage_keys: Optional[List[str]] = None,
+        # ✅ Full LB
+        routing: str = "stage",  # "stage" | "module"
+        model_name: str = "default",
+        total_blocks: Optional[int] = None,
+        start_block: int = 0,
     ):
         """
         Args:
             device: PyTorch device (cuda:0, cuda:1, etc.)
-            stage: Current stage (0 for Stage0, 1 for Stage1)
-            dht_initial_peers: List of initial DHT peers (e.g., ["ip1:port1", "ip2:port2"])
+            stage: Current stage (0 for Stage0)
+            dht_initial_peers: List of initial DHT peers (full multiaddrs recommended)
             dht_port: Port for DHT
             rpc_port: Port for RPC server
             timeout: Timeout for RPC calls in seconds
-            stage_keys: Ordered list of stage DHT keys (excluding stage0). Default: stage1, stage2, stage3
+
+            routing:
+                - "stage": 기존 mini_petals stage 체인
+                - "module": petals:module 기반 route 계산 후 호출
+            model_name/total_blocks/start_block:
+                routing="module"에서 필수
         """
         self.device = device
         self.stage = stage
@@ -59,24 +84,31 @@ class RpcTransport:
         self.rpc_port = rpc_port
         self.timeout = timeout
         self.local_ip = self._get_local_ip()
+
+        self.routing = routing
+        self.model_name = model_name
+        self.total_blocks = total_blocks
+        self.start_block = start_block
+
         self.stage_keys = stage_keys or ["mini_petals:stage1", "mini_petals:stage2", "mini_petals:stage3"]
         self.sampling = {"temperature": float(temperature), "top_p": float(top_p), "top_k": int(top_k)}
 
-        self._last_token: Optional[int] = None # 마지막으로 받은 토큰 ID
-        self.remote_info: Dict[str, Dict] = {} # 원격 스테이지 연결 정보
-        self.last_prefill_stage_times: List[Tuple[str, float]] = [] # Prefill 단계 Stage별 소요 시간
-        self.last_prefill_total: Optional[float] = None # Prefill 단계 전체 소요 시간
-        self.last_decode_stage_times: List[Tuple[str, float]] = [] # 마지막 Decode Step에서 Stage별 소요 시간
-        self.last_decode_total: Optional[float] = None # 마지막 Decode Step 전체 소요 시간
-        self.decode_stage_history: List[List[Tuple[str, float]]] = [] # 모든 Decode Step의 Stage별 소요 시간 히스토리
-        self.decode_total_times: List[float] = [] # 모든 Decode Step의 전체 소요 시간 리스트
-        
+        self._last_token: Optional[int] = None
+        self.remote_info: Dict[str, Dict[str, Any]] = {}  # key(stage_key/module_key) -> {"peer_id": PeerID, "maddrs":[...]}
+        self.last_prefill_stage_times: List[Tuple[str, float]] = []
+        self.last_prefill_total: Optional[float] = None
+        self.last_decode_stage_times: List[Tuple[str, float]] = []
+        self.last_decode_total: Optional[float] = None
+        self.decode_stage_history: List[List[Tuple[str, float]]] = []
+        self.decode_total_times: List[float] = []
+
         # Fault tolerance: Client-side cache (Petals 논문 방식)
-        # 각 stage로 보낸 과거 입력(hidden states)을 저장하여 서버 실패 시 복구에 사용
-        # Session별로 분리하여 여러 session 동시 처리 지원
-        self.client_cache: Dict[str, Dict[str, List[torch.Tensor]]] = {}  # {stage_key: {session_id: [past_inputs]}}
-        self.failed_stages: Set[str] = set()  # 실패한 stage 추적
-        self.failed_peers: Dict[str, Set[str]] = {}  # {stage_key: {failed_peer_id, ...}} - 실패한 서버 추적
+        self.client_cache: Dict[str, Dict[str, List[torch.Tensor]]] = {}
+        self.failed_stages: Set[str] = set()
+        self.failed_peers: Dict[str, Set[str]] = {}
+
+        # Full LB: session별 route 캐시
+        self.session_routes: Dict[str, List[Tuple[str, bool]]] = {}  # session_id -> [(key, expect_hidden), ...]
 
         initial_peers_list = self._format_initial_peers(dht_initial_peers)
 
@@ -84,7 +116,6 @@ class RpcTransport:
         self.dht = DHT(
             start=True,
             initial_peers=initial_peers_list if initial_peers_list else None,
-            # Use default host/announce to avoid strict multiaddr parsing issues
         )
 
         self.p2p: Optional[P2P] = None
@@ -96,7 +127,11 @@ class RpcTransport:
         else:
             logger.info("Server stages do not rely on RpcTransport; only client helpers are active")
 
-        logger.info(f"RpcTransport initialized: stage={stage}, peer_id={self.peer_id}")
+        logger.info(f"RpcTransport initialized: stage={stage}, peer_id={self.peer_id}, routing={self.routing}")
+
+    # ----------------------------
+    # Small helpers (compat/safety)
+    # ----------------------------
 
     def _format_initial_peers(self, dht_initial_peers: List[str]) -> List[str]:
         initial_peers_list = []
@@ -104,7 +139,6 @@ class RpcTransport:
             peer = peer.strip()
             if not peer:
                 continue
-            # Require full multiaddr with peer ID to avoid invalid p2p multiaddr errors
             if "/p2p/" in peer:
                 initial_peers_list.append(peer)
             elif ":" in peer:
@@ -117,7 +151,6 @@ class RpcTransport:
         return initial_peers_list
 
     def _get_local_ip(self) -> str:
-        """Get local IP address."""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -127,35 +160,123 @@ class RpcTransport:
         except Exception:
             return "127.0.0.1"
 
+    # ✅ FIX: event loop 관련 RuntimeError만 처리하고, 코루틴 내부 예외는 재실행하지 않음
     def _run_async(self, coro):
-        """Run async coroutine in sync context."""
+        """
+        Run an async coroutine from sync context safely.
+        - If we're already inside an event loop: run in a separate thread with asyncio.run()
+        - If no event loop / closed loop: asyncio.run()
+        - Otherwise: loop.run_until_complete()
+        """
         try:
             loop = asyncio.get_event_loop()
-            if loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    future = executor.submit(asyncio.run, coro)
-                    return future.result()
-            else:
-                return loop.run_until_complete(coro)
         except RuntimeError:
             return asyncio.run(coro)
 
+        if loop.is_closed():
+            return asyncio.run(coro)
+
+        if loop.is_running():
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(asyncio.run, coro)
+                return future.result()
+        return loop.run_until_complete(coro)
+
     async def _create_p2p(self) -> P2P:
-        # Use default listen/announce addrs to avoid multiaddr parsing issues across platforms
         return await P2P.create()
+
+    def _dht_get_compat(self, key: str, *, latest: bool = False, return_metadata: bool = False):
+        """
+        hivemind 버전에 따라 DHT.get 시그니처가 다를 수 있어 TypeError 방어.
+        - latest/return_metadata 지원하면 사용
+        - 지원 안하면 인자 없이 get(key)로 fallback
+        """
+        if return_metadata:
+            try:
+                return self.dht.get(key, return_metadata=True)  # type: ignore[arg-type]
+            except TypeError:
+                return self.dht.get(key)
+        if latest:
+            try:
+                return self.dht.get(key, latest=True)  # type: ignore[arg-type]
+            except TypeError:
+                return self.dht.get(key)
+        return self.dht.get(key)
+
+    def _extract_dht_value(self, res: Any) -> Any:
+        """
+        hivemind DHT.get 반환 형태를 통일해서 value를 뽑아준다.
+        가능한 케이스:
+        - res.value 존재 (DHTValue)
+        - res 자체가 dict
+        - res가 (value, meta) 형태의 튜플/리스트
+        """
+        if res is None:
+            return None
+        if hasattr(res, "value"):
+            return res.value
+        if isinstance(res, dict):
+            return res
+        if isinstance(res, (list, tuple)) and len(res) > 0:
+            first = res[0]
+            if hasattr(first, "value"):
+                return first.value
+            return first
+        return None
+
+    def _filter_maddrs_for_connect(self, maddrs: List[str]) -> List["Multiaddr"]:
+        """
+        Convert list[str] multiaddrs to list[Multiaddr] suitable for hivemind connect.
+        Strips /p2p/<peer_id> suffix if present.
+        """
+        try:
+            from multiaddr import Multiaddr
+        except Exception:
+            return []
+
+        filtered: List["Multiaddr"] = []
+        for m in maddrs or []:
+            try:
+                base = m.split("/p2p/")[0]  # keep /ip4/.../tcp/...
+                ma = Multiaddr(base)
+                protos = [p.name for p in ma.protocols()]
+                if any(p in ("ip4", "ip6") for p in protos) and any(p in ("tcp", "quic") for p in protos):
+                    filtered.append(ma)
+            except Exception:
+                continue
+        return filtered
+
+    async def _connect_peer_if_possible(self, stage_key: str, peer_id: PeerID, maddrs: List[str]) -> None:
+        """
+        ✅ Full LB 핵심:
+        remote_info가 이미 있어도(connect 안 한 상태) RPC가 나가면
+        'failed to find any peer in table'가 뜬다.
+        그래서 info가 있든 없든 maddrs가 있으면 항상 connect를 시도한다.
+        """
+        if self.p2p is None or not maddrs:
+            return
+        try:
+            filtered = self._filter_maddrs_for_connect(maddrs)
+            if filtered:
+                await self.p2p._client.connect(peer_id, filtered)  # NOTE: internal client
+                logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
+        except Exception as e:
+            logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
+
+    # ----------------------------
+    # Peer discovery / readiness
+    # ----------------------------
 
     async def _discover_peer(
         self,
         stage_key: str,
         max_retries: int = 10,
         retry_delay: float = 1.0,
-        exclude_peer_ids: Optional[Set[str]] = None
+        exclude_peer_ids: Optional[Set[str]] = None,
     ) -> Tuple[PeerID, List[str]]:
         """
-        Find server peer_id via DHT for a given stage key.
-        - ✅ 여러 후보(subkey들)를 가져와서
-        - ✅ exclude_peer_ids(실패 서버) 제외하고
-        - ✅ 그 중 하나를 선택해서 반환
+        Find server peer_id via DHT for a given key (stage key or module key).
+        - 여러 후보(subkey들)를 가져와서 exclude_peer_ids 제외 후 선택
         """
         if exclude_peer_ids is None:
             exclude_peer_ids = set()
@@ -163,160 +284,78 @@ class RpcTransport:
         loop = asyncio.get_running_loop()
 
         def _get_candidates_sync():
-            """Get candidate peers from DHT, handling different hivemind versions."""
-            candidates = []
-            
-            # hivemind 버전에 따라 return_metadata 지원 여부가 다름
-            # 먼저 return_metadata 없이 시도
+            candidates: List[Tuple[str, List[str], float]] = []
             try:
-                res = self.dht.get(stage_key)
-            except TypeError:
-                # return_metadata가 필수인 경우를 대비해 다시 시도
-                try:
-                    res = self.dht.get(stage_key, return_metadata=True)
-                except TypeError:
-                    # return_metadata를 지원하지 않는 버전
-                    res = self.dht.get(stage_key)
-            
-            if res is None:
-                logger.warning(f"{stage_key}: DHT.get returned None (no value for this key)")
+                res = self._dht_get_compat(stage_key, return_metadata=False)
+            except Exception as e:
+                logger.warning(f"{stage_key}: DHT.get failed: {e}")
                 return []
-            
-            # res가 다양한 형태일 수 있음
-            value = None
-            if hasattr(res, 'value'):
-                value = res.value
-            elif isinstance(res, dict):
-                value = res
-            elif isinstance(res, (list, tuple)) and len(res) > 0:
-                # 일부 버전은 리스트/튜플로 반환
-                value = res[0] if isinstance(res[0], dict) else res
-            
+
+            value = self._extract_dht_value(res)
             if value is None:
-                logger.warning(f"{stage_key}: DHT.get returned object without usable value (type={type(res).__name__})")
+                logger.warning(f"{stage_key}: DHT.get returned None/empty")
                 return []
 
-            # hivemind 버전에 따라 value가 dict(subkey->entry)일 수 있음
-            if isinstance(value, dict):
-                # subkey가 있는 경우 (여러 서버)
-                debug_entries = []
-                excluded_peers = []
-                for subk, v in value.items():
-                    entry = v
-                    # ValueWithExpiration 객체 처리 (hivemind의 일반적인 반환 형태)
-                    if hasattr(v, 'value'):
-                        entry = v.value
-                    # 어떤 버전은 (entry, expiration, ...) 튜플로 줄 때가 있음
-                    elif isinstance(v, tuple) and len(v) > 0:
-                        entry = v[0]
-                    # dict에 "value" 키가 있는 경우
-                    elif isinstance(v, dict) and "value" in v:
-                        entry = v.get("value", v)
+            if not isinstance(value, dict):
+                logger.warning(f"{stage_key}: Unexpected DHT value type {type(value).__name__}")
+                return []
 
-                    if not isinstance(entry, dict):
-                        logger.debug(f"{stage_key}: Skipping non-dict entry for subkey {subk}, type={type(entry).__name__}, value={entry}")
-                        continue
+            excluded = 0
+            for subk, v in value.items():
+                entry = v.value if hasattr(v, "value") else v
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
 
-                    peer_id_str = entry.get("peer_id") or str(subk)
-                    if not peer_id_str:
-                        continue
+                if not isinstance(entry, dict):
+                    continue
 
-                    # 실패한 peer 제외
-                    if peer_id_str in exclude_peer_ids:
-                        excluded_peers.append(peer_id_str)
-                        logger.debug(f"{stage_key}: Excluding failed peer {peer_id_str[:8]}... (subkey={subk})")
-                        continue
+                peer_id_str = entry.get("peer_id") or str(subk)
+                if not peer_id_str:
+                    continue
+                if peer_id_str in exclude_peer_ids:
+                    excluded += 1
+                    continue
 
-                    # maddrs
-                    maddrs = entry.get("p2p_maddrs") or []
-                    ts = entry.get("timestamp", 0)
+                maddrs = entry.get("p2p_maddrs") or []
+                ts = float(entry.get("timestamp", 0) or 0)
+                candidates.append((peer_id_str, maddrs, ts))
 
-                    candidates.append((peer_id_str, maddrs, ts))
-                    debug_entries.append(
-                        {
-                            "subkey": str(subk),
-                            "peer_id": peer_id_str,
-                            "maddrs": maddrs,
-                            "timestamp": ts,
-                        }
-                    )
-
-                # 상세 로그 출력
-                logger.info(
-                    f"{stage_key}: DHT discovery - "
-                    f"total_entries={len(value)}, "
-                    f"candidates={len(candidates)}, "
-                    f"excluded={len(excluded_peers)} (excluded_peer_ids={list(exclude_peer_ids)}), "
-                    f"candidate_peers={[c[0][:8]+'...' for c in candidates]}"
-                )
-                if debug_entries:
-                    logger.debug(f"{stage_key}: DHT entries={debug_entries}")
-                if excluded_peers:
-                    logger.debug(f"{stage_key}: Excluded peers={[p[:8]+'...' for p in excluded_peers]}")
-                if not candidates and len(value) > 0:
-                    logger.warning(
-                        f"{stage_key}: DHT dict value has {len(value)} entries but no usable candidates "
-                        f"(excluded={len(excluded_peers)}, exclude_peer_ids={list(exclude_peer_ids)})"
-                    )
-            else:
-                # 단일 entry 형태 (subkey 없음)
-                if isinstance(value, dict):
-                    peer_id_str = value.get("peer_id")
-                    if peer_id_str and peer_id_str not in exclude_peer_ids:
-                        maddrs = value.get("p2p_maddrs") or []
-                        ts = value.get("timestamp", 0)
-                        candidates.append((peer_id_str, maddrs, ts))
-                        logger.info(
-                            f"{stage_key}: DHT single entry="
-                            f"{{'peer_id': {peer_id_str}, 'maddrs': {maddrs}, 'timestamp': {ts}}}"
-                        )
-                else:
-                    logger.warning(
-                        f"{stage_key}: Unexpected DHT value type {type(value).__name__}, raw value={value}"
-                    )
-
+            logger.info(
+                f"{stage_key}: DHT discovery - total_entries={len(value)}, candidates={len(candidates)}, excluded={excluded}"
+            )
             return candidates
 
         for attempt in range(max_retries):
+            candidates = []
             try:
                 candidates = await loop.run_in_executor(None, _get_candidates_sync)
-
-                if candidates:
-                    # 선택 정책:
-                    # 1) timestamp 최신순으로 상위 몇 개 추려서
-                    # 2) 그 중 랜덤 선택 (부하 분산 + 최신 고집 방지)
-                    candidates.sort(key=lambda x: x[2], reverse=True)
-                    top = candidates[: min(5, len(candidates))]
-                    peer_id_str, maddrs, _ts = random.choice(top)
-
-                    logger.info(
-                        f"{stage_key}: Selected peer from {len(candidates)} candidates - "
-                        f"peer_id={peer_id_str[:8]}..., "
-                        f"timestamp={_ts}, "
-                        f"maddrs_count={len(maddrs)}"
-                    )
-                    peer_id = PeerID.from_base58(peer_id_str)
-                    return peer_id, maddrs
-
-                logger.warning(
-                    f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}, "
-                    f"excluded_peer_ids={[p[:8]+'...' for p in exclude_peer_ids] if exclude_peer_ids else 'none'}), "
-                    f"retrying... (attempt {attempt+1}/{max_retries})"
-                )
-
             except Exception as e:
                 logger.warning(f"Attempt {attempt + 1} to find peer for {stage_key} failed: {e}")
 
+            if candidates:
+                candidates.sort(key=lambda x: x[2], reverse=True)
+                top = candidates[: min(5, len(candidates))]
+                peer_id_str, maddrs, ts = random.choice(top)
+                logger.info(
+                    f"{stage_key}: Selected peer - peer_id={peer_id_str[:8]}..., timestamp={ts}, maddrs_count={len(maddrs)}"
+                )
+                return PeerID.from_base58(peer_id_str), maddrs
+
+            logger.warning(
+                f"{stage_key}: no candidates found (excluded={len(exclude_peer_ids)}), retrying... "
+                f"(attempt {attempt + 1}/{max_retries})"
+            )
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
 
-        raise RuntimeError(
-            f"Could not find peer via DHT key '{stage_key}' (excluded {len(exclude_peer_ids)} failed peers)"
-        )
+        raise RuntimeError(f"Could not find peer via DHT key '{stage_key}' (excluded {len(exclude_peer_ids)} failed peers)")
 
     async def _ensure_ready(self, stage_key: str, force_refresh: bool = False):
         if self.stage != 0:
             raise RuntimeError("RpcTransport client helpers should only be used on stage0")
+
         if self.p2p is None:
             self.p2p = await self._create_p2p()
             self.peer_id = self.p2p.peer_id
@@ -325,39 +364,145 @@ class RpcTransport:
             self.remote_info.pop(stage_key, None)
 
         info = self.remote_info.get(stage_key)
+
+        # 1) info가 없으면 DHT에서 찾는다
         if info is None:
             exclude = self.failed_peers.get(stage_key, set())
             peer_id, maddrs = await self._discover_peer(stage_key, exclude_peer_ids=exclude)
             info = {"peer_id": peer_id, "maddrs": maddrs}
             self.remote_info[stage_key] = info
 
-            # connect 시도
-            if maddrs:
-                try:
-                    from multiaddr import Multiaddr
-                    filtered = []
-                    for m in maddrs:
-                        try:
-                            base = m.split("/p2p/")[0]
-                            ma = Multiaddr(base)
-                            if ma.protocols()[0].name in ("ip4", "ip6", "tcp", "quic"):
-                                filtered.append(ma)
-                        except Exception:
-                            pass
-                    if filtered:
-                        await self.p2p._client.connect(peer_id, filtered)
-                        logger.info(f"Connected to {stage_key} via maddrs: {maddrs}")
-                    else:
-                        logger.warning(f"No usable tcp/ip multiaddrs to connect: {maddrs}")
-                except Exception as e:
-                    logger.warning(f"Could not connect to {stage_key} via maddrs {maddrs}: {e}")
-
-        # optional: peers 확인
+        # 2) Full LB(module routing)에서 핵심: info가 있어도 connect를 반드시 시도
         try:
-            await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=5)
+            peer_id = info["peer_id"]
+            maddrs = info.get("maddrs") or []
+            await self._connect_peer_if_possible(stage_key, peer_id, maddrs)
+        except Exception as e:
+            logger.warning(f"_ensure_ready connect step failed for {stage_key}: {e}")
+
+        # optional small wait
+        try:
+            await asyncio.wait_for(self.p2p.wait_for_at_least_n_peers(1), timeout=2)
         except Exception:
             pass
 
+    # ----------------------------
+    # Routing (stage / module)
+    # ----------------------------
+
+    async def _compute_module_route(self, session_id: str) -> List[Tuple[str, bool]]:
+        """
+        petals:module 기반으로 0..total_blocks를 덮는 route를 만든다.
+        greedy: 현재 block을 커버하는 후보 중 end_block이 가장 큰 서버 선택 (동률이면 throughput)
+        """
+        if self.total_blocks is None:
+            raise ValueError("total_blocks is required when routing='module'")
+
+        cur = int(self.start_block)
+        route: List[Tuple[str, bool]] = []
+        hops = 0
+
+        while cur < self.total_blocks:
+            mk = get_module_key(cur, self.model_name)
+
+            res = self._dht_get_compat(mk, latest=True)
+            value = self._extract_dht_value(res)
+
+            if value is None or not isinstance(value, dict):
+                raise RuntimeError(f"[module routing] No candidates for {mk} (block={cur})")
+
+            # candidates: (end_block, throughput, peer_id_str, maddrs, final_stage)
+            candidates: List[Tuple[int, float, str, List[str], bool]] = []
+            for subk, raw in value.items():
+                entry = raw.value if hasattr(raw, "value") else raw
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
+
+                if not isinstance(entry, dict):
+                    continue
+
+                pid = entry.get("peer_id") or str(subk)
+                if not pid:
+                    continue
+
+                st = entry.get("start_block")
+                ed = entry.get("end_block")
+                if st is None or ed is None:
+                    continue
+
+                st_i = int(st)
+                ed_i = int(ed)
+                if not (st_i <= cur < ed_i):
+                    continue
+
+                thr = float(entry.get("throughput") or 0.0)
+                maddrs = entry.get("p2p_maddrs") or []
+                fin = bool(entry.get("final_stage", False))
+                candidates.append((ed_i, thr, pid, maddrs, fin))
+
+            if not candidates:
+                raise RuntimeError(f"[module routing] No server covers block={cur} (key={mk})")
+
+            candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            end_block, _thr, pid, maddrs, _fin = candidates[0]
+
+            # 이 hop을 "block_cur 키"로 호출하되, peer를 고정(pin)
+            key = mk
+            self.remote_info[key] = {"peer_id": PeerID.from_base58(pid), "maddrs": maddrs}
+
+            is_last = end_block >= self.total_blocks
+            route.append((key, not is_last))
+
+            cur = end_block
+            hops += 1
+            if hops > self.total_blocks + 5:
+                raise RuntimeError("[module routing] Route seems stuck; check start/end in DHT entries.")
+
+        # 마지막 hop은 final_stage 서버인지 확인
+        last_key, _ = route[-1]
+        last_peer_obj = self.remote_info[last_key]["peer_id"]
+        last_peer = last_peer_obj.to_base58()
+
+        last_res = self._dht_get_compat(last_key, latest=True)
+        last_value = self._extract_dht_value(last_res)
+
+        ok = False
+        if isinstance(last_value, dict):
+            for subk, raw in last_value.items():
+                entry = raw.value if hasattr(raw, "value") else raw
+                if isinstance(entry, (list, tuple)) and len(entry) > 0:
+                    entry = entry[0]
+                if isinstance(entry, dict) and "value" in entry and isinstance(entry["value"], dict):
+                    entry = entry["value"]
+
+                if not isinstance(entry, dict):
+                    continue
+                pid = entry.get("peer_id") or str(subk)
+                if pid == last_peer and bool(entry.get("final_stage", False)):
+                    ok = True
+                    break
+
+        if not ok:
+            raise RuntimeError(
+                "[module routing] Last hop server is not marked as final_stage; need StageLast span at the end."
+            )
+
+        logger.info(f"[module routing] Built route for session {session_id[:8]}: {[k for k, _ in route]}")
+        return route
+
+    async def _get_route(self, session_id: str) -> List[Tuple[str, bool]]:
+        if self.routing == "stage":
+            return [(k, i < len(self.stage_keys) - 1) for i, k in enumerate(self.stage_keys)]
+
+        if session_id not in self.session_routes:
+            self.session_routes[session_id] = await self._compute_module_route(session_id)
+        return self.session_routes[session_id]
+
+    # ----------------------------
+    # RPC calls
+    # ----------------------------
 
     def _extract_token_id(self, response: runtime_pb2.ExpertResponse) -> Optional[int]:
         metadata = MSGPackSerializer.loads(response.metadata) if response.metadata else {}
@@ -374,12 +519,11 @@ class RpcTransport:
     async def _call_stage_unary(
         self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool
     ):
-        """Unary RPC call for a given stage."""
         await self._ensure_ready(stage_key)
         peer_id = self.remote_info[stage_key]["peer_id"]
         request = runtime_pb2.ExpertRequest(uid=stage_key, tensors=serialized_tensors, metadata=metadata)
         response = await asyncio.wait_for(
-            self.p2p.call_protobuf_handler(
+            self.p2p.call_protobuf_handler(  # type: ignore[union-attr]
                 peer_id,
                 "StageConnectionHandler.rpc_forward",
                 request,
@@ -392,6 +536,7 @@ class RpcTransport:
             if not response.tensors:
                 raise ValueError(f"{stage_key} returned no tensors")
             return deserialize_torch_tensor(response.tensors[0])
+
         token_id = self._extract_token_id(response)
         if token_id is None:
             raise ValueError(f"{stage_key} returned no token")
@@ -400,16 +545,16 @@ class RpcTransport:
     async def _call_stage_stream(
         self, stage_key: str, serialized_tensors: list, metadata: bytes, timeout: float, expect_hidden: bool
     ):
-        """Stream RPC call for a given stage."""
         await self._ensure_ready(stage_key)
         peer_id = self.remote_info[stage_key]["peer_id"]
+
         parts = (
             runtime_pb2.ExpertRequest(uid=stage_key, tensors=[part], metadata=metadata)
             for tensor in serialized_tensors
             for part in split_for_streaming(tensor, DEFAULT_MAX_MSG_SIZE)
         )
 
-        outputs = self.p2p.iterate_protobuf_handler(
+        outputs = self.p2p.iterate_protobuf_handler(  # type: ignore[union-attr]
             peer_id,
             "StageConnectionHandler.rpc_forward_stream",
             iter_as_aiter(parts),
@@ -431,13 +576,13 @@ class RpcTransport:
             if not tensors:
                 raise ValueError(f"{stage_key} stream returned no tensors")
             return deserialize_torch_tensor(tensors[0])
-        else:
-            if token_id is None:
-                if tensors:
-                    token_id = int(deserialize_torch_tensor(tensors[0]).item())
-                else:
-                    raise ValueError(f"{stage_key} stream returned no token")
-            return token_id
+
+        if token_id is None:
+            if tensors:
+                token_id = int(deserialize_torch_tensor(tensors[0]).item())
+            else:
+                raise ValueError(f"{stage_key} stream returned no token")
+        return token_id
 
     async def _call_stage_with_recovery(
         self,
@@ -449,261 +594,155 @@ class RpcTransport:
         is_replay: bool = False,
         session_id: Optional[str] = None,
     ):
-        """
-        RPC 호출 + 실패 시 자동 복구 (Petals fault tolerance).
-        
-        Args:
-            is_replay: True면 replay 모드 (복구 중), 실패 시 재시도 안 함
-            session_id: Replay 시 필요
-        """
         max_recovery_attempts = 3
-        
+
         for attempt in range(max_recovery_attempts):
             try:
-                # 기존 RPC 호출
-                # serialized_tensors[0]는 runtime_pb2.Tensor protobuf 메시지이므로 크기 계산 방법이 다름
                 if serialized_tensors:
                     first_tensor = serialized_tensors[0]
-                    # runtime_pb2.Tensor인 경우 ByteSize() 사용, bytes인 경우 len() 사용
-                    if hasattr(first_tensor, 'ByteSize'):
+                    if hasattr(first_tensor, "ByteSize"):
                         size = first_tensor.ByteSize()
                     elif isinstance(first_tensor, bytes):
                         size = len(first_tensor)
                     else:
-                        # fallback: SerializeToString()으로 변환 후 크기 확인
                         try:
                             size = len(first_tensor.SerializeToString())
                         except AttributeError:
                             size = 0
                 else:
                     size = 0
+
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
                 return await forward_fn(stage_key, serialized_tensors, metadata, timeout, expect_hidden)
+
             except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError, P2PDaemonError, P2PHandlerError) as e:
                 if is_replay:
-                    # Replay 중 실패는 복구 불가
                     logger.error(f"Replay failed for {stage_key}: {e}")
                     raise
-                
-                logger.warning(f"Stage {stage_key} failed (attempt {attempt+1}/{max_recovery_attempts}): {e}")
-                
-                # 실패한 stage 기록
+
+                logger.warning(f"Stage {stage_key} failed (attempt {attempt + 1}/{max_recovery_attempts}): {e}")
                 self.failed_stages.add(stage_key)
-                
-                # 실패한 peer_id 기록
+
+                # mark failed peer
                 if stage_key in self.remote_info:
                     pid_obj = self.remote_info[stage_key].get("peer_id", None)
-                    # PeerID -> base58 string으로 통일
+                    failed_peer_id = ""
                     if pid_obj is not None:
                         try:
                             failed_peer_id = pid_obj.to_base58()
                         except Exception:
                             failed_peer_id = str(pid_obj)
-                    else:
-                        failed_peer_id = ""
-
                     if failed_peer_id:
-                        if stage_key not in self.failed_peers:
-                            self.failed_peers[stage_key] = set()
-                        self.failed_peers[stage_key].add(failed_peer_id)
+                        self.failed_peers.setdefault(stage_key, set()).add(failed_peer_id)
                         logger.info(f"Marked peer {failed_peer_id[:8]}... as failed for {stage_key}")
 
-                
-                # 새 서버 찾기 (실패한 서버 제외)
                 try:
                     exclude_peers = self.failed_peers.get(stage_key, set())
-                    logger.info(
-                        f"{stage_key}: Attempting recovery - "
-                        f"excluded_peers={[p[:8]+'...' for p in exclude_peers] if exclude_peers else 'none'}, "
-                        f"failed_peers_count={len(exclude_peers)}"
-                    )
                     new_peer_id, new_maddrs = await self._discover_peer(
-                        stage_key, 
-                        max_retries=5, 
-                        retry_delay=0.5,
-                        exclude_peer_ids=exclude_peers
+                        stage_key, max_retries=5, retry_delay=0.5, exclude_peer_ids=exclude_peers
                     )
-                    logger.info(
-                        f"{stage_key}: Found replacement server - "
-                        f"peer_id={new_peer_id.to_base58()[:8]}..., "
-                        f"maddrs={new_maddrs}"
-                    )
-                    
-                    # remote_info 업데이트
-                    self.remote_info[stage_key] = {
-                        "peer_id": new_peer_id,
-                        "maddrs": new_maddrs
-                    }
 
-                    # ✅ force_refresh로 새 peer로 강제 재연결 준비
-                    await self._ensure_ready(stage_key, force_refresh=True)
+                    self.remote_info[stage_key] = {"peer_id": new_peer_id, "maddrs": new_maddrs}
+                    await self._connect_peer_if_possible(stage_key, new_peer_id, new_maddrs)
 
-                    
-                    # P2P 연결 재설정
-                    if self.p2p and new_maddrs:
-                        try:
-                            from multiaddr import Multiaddr
-                            filtered = []
-                            for m in new_maddrs:
-                                try:
-                                    base = m.split("/p2p/")[0]
-                                    ma = Multiaddr(base)
-                                    if ma.protocols()[0].name in ("ip4", "ip6", "tcp", "quic"):
-                                        filtered.append(ma)
-                                except Exception:
-                                    pass
-                            if filtered:
-                                await self.p2p._client.connect(new_peer_id, filtered)
-                                logger.info(f"Reconnected to new {stage_key} server")
-                        except Exception as conn_e:
-                            logger.warning(f"Failed to reconnect to {stage_key}: {conn_e}")
-                    
-                    # Client-side cache에서 past_inputs 재전송 (replay)
-                    if (stage_key in self.client_cache and 
-                        session_id in self.client_cache[stage_key] and 
-                        len(self.client_cache[stage_key][session_id]) > 0):
-                        past_count = len(self.client_cache[stage_key][session_id])
-                        logger.info(f"Replaying {past_count} past inputs to {stage_key} for session {session_id[:8]}")
-                        try:
-                            await self._replay_past_inputs(stage_key, session_id, metadata)
-                            logger.info(f"Replay completed successfully for {stage_key} (session {session_id[:8]})")
-                        except Exception as replay_e:
-                            logger.error(f"Replay failed for {stage_key} (session {session_id[:8]}): {replay_e}")
-                            # Replay 실패는 recovery 실패로 처리
-                            raise RuntimeError(f"Replay failed for {stage_key}: {replay_e}") from replay_e
-                    
-                    # 실패한 stage 제거 (복구 시도 완료)
+                    if (
+                        stage_key in self.client_cache
+                        and session_id is not None
+                        and session_id in self.client_cache[stage_key]
+                        and len(self.client_cache[stage_key][session_id]) > 0
+                    ):
+                        await self._replay_past_inputs(stage_key, session_id, metadata)
+
                     self.failed_stages.discard(stage_key)
-                    
-                    # 재시도 전에 서버가 준비될 시간을 줌
                     await asyncio.sleep(0.2)
-                    
-                    # 재시도
+
                     if attempt < max_recovery_attempts - 1:
                         continue
-                    else:
-                        raise RuntimeError(f"Failed to recover {stage_key} after {max_recovery_attempts} attempts") from e
+                    raise RuntimeError(f"Failed to recover {stage_key} after {max_recovery_attempts} attempts") from e
+
                 except Exception as recovery_e:
                     logger.error(f"Recovery failed for {stage_key}: {recovery_e}")
                     if attempt < max_recovery_attempts - 1:
                         await asyncio.sleep(1.0)
                         continue
-                    else:
-                        raise RuntimeError(f"Failed to recover {stage_key}: {recovery_e}") from recovery_e
+                    raise RuntimeError(f"Failed to recover {stage_key}: {recovery_e}") from recovery_e
 
-    async def _replay_past_inputs(
-        self,
-        stage_key: str,
-        session_id: str,
-        base_metadata: bytes
-    ):
-        """
-        Client-side cache의 past_inputs를 새 서버에 재전송하여 KV 캐시 복구.
-        Petals 논문의 fault tolerance 메커니즘.
-        """
-        if (stage_key not in self.client_cache or 
-            session_id not in self.client_cache[stage_key] or 
-            len(self.client_cache[stage_key][session_id]) == 0):
-            logger.warning(f"No past inputs to replay for {stage_key} (session {session_id[:8]})")
+    async def _replay_past_inputs(self, stage_key: str, session_id: str, base_metadata: bytes):
+        if (
+            stage_key not in self.client_cache
+            or session_id not in self.client_cache[stage_key]
+            or len(self.client_cache[stage_key][session_id]) == 0
+        ):
             return
-        
+
         past_inputs = self.client_cache[stage_key][session_id]
-        logger.info(f"Replaying {len(past_inputs)} inputs to {stage_key} for session {session_id[:8]}")
-        
-        base_metadata_dict = MSGPackSerializer.loads(base_metadata)
-        
-        # cur_len 누적 계산 (prefill + decode steps)
+        base_metadata_dict = MSGPackSerializer.loads(base_metadata) if base_metadata else {}
+
         cumulative_len = 0
         for idx, past_input in enumerate(past_inputs):
-            # 각 past_input을 순서대로 재전송
-            # metadata에서 is_prefill, seq_len 등을 적절히 설정
-            replay_metadata_dict = base_metadata_dict.copy()
-            seq_len = past_input.shape[1]
-            
+            replay_metadata_dict = dict(base_metadata_dict)
+            seq_len = int(past_input.shape[1])
+
             if idx == 0:
-                # 첫 번째는 prefill
                 replay_metadata_dict["is_prefill"] = True
                 cumulative_len = seq_len
             else:
-                # 이후는 decode steps
                 replay_metadata_dict["is_prefill"] = False
                 cumulative_len += seq_len
-            
+
             replay_metadata_dict["seq_len"] = seq_len
             replay_metadata_dict["cur_len"] = cumulative_len
             replay_metadata_dict["session_id"] = session_id
-            replay_metadata_dict["is_replay"] = True  # replay 플래그
-            
+            replay_metadata_dict["is_replay"] = True
+
             replay_metadata = MSGPackSerializer.dumps(replay_metadata_dict)
             serialized = serialize_torch_tensor(past_input)
-            
-            # protobuf Tensor 크기 계산 (hivemind 버전 호환)
-            if hasattr(serialized, 'ByteSize'):
+
+            if hasattr(serialized, "ByteSize"):
                 size = serialized.ByteSize()
             elif isinstance(serialized, bytes):
                 size = len(serialized)
             else:
-                # fallback: SerializeToString()으로 변환 후 크기 확인
                 try:
                     size = len(serialized.SerializeToString())
                 except AttributeError:
                     size = 0
-            
-            # 재전송 (응답은 무시, KV 캐시 복구만 목적)
-            try:
-                forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
-                await forward_fn(
-                    stage_key,
-                    [serialized],
-                    replay_metadata,
-                    self.timeout,
-                    expect_hidden=True
-                )
-                logger.debug(f"Replay step {idx+1}/{len(past_inputs)} completed for {stage_key} (session {session_id[:8]})")
-            except Exception as e:
-                logger.error(f"Replay step {idx+1}/{len(past_inputs)} failed for {stage_key} (session {session_id[:8]}): {e}")
-                # Replay 실패는 치명적이므로 예외를 다시 발생시켜서 recovery 실패로 처리
-                raise RuntimeError(f"Replay failed at step {idx+1}/{len(past_inputs)} for {stage_key}: {e}") from e
-        
-        logger.info(f"Replay completed for {stage_key} (session {session_id[:8]})")
+
+            forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
+            await forward_fn(stage_key, [serialized], replay_metadata, self.timeout, expect_hidden=True)
+
+    # ----------------------------
+    # Public API: prefill / decode
+    # ----------------------------
 
     def send_prefill(self, L: int, hidden: torch.Tensor, session_id: str, max_length: int):
-        """Send prefill hidden states through all remote stages."""
         if self.stage != 0:
             raise RuntimeError("send_prefill should only be called by stage0")
 
         async def _send():
             start_all = time.perf_counter()
-            # GPU에 있던 tensor를 CPU로 이동(for sending)
             hidden_cpu = hidden.cpu().detach()
             metadata = MSGPackSerializer.dumps(
                 {
                     "session_id": session_id,
-                    "seq_len": L,
-                    "cur_len": L,
+                    "seq_len": int(L),
+                    "cur_len": int(L),
                     "is_prefill": True,
-                    "max_length": max_length,
+                    "max_length": int(max_length),
                     **self.sampling,
                 }
             )
 
             cur = hidden_cpu
             stage_times: List[Tuple[str, float]] = []
-            for idx, stage_key in enumerate(self.stage_keys):
-                expect_hidden = idx < len(self.stage_keys) - 1
-                
-                # Client-side cache에 입력 저장 (fault tolerance, session별 관리)
-                if stage_key not in self.client_cache:
-                    self.client_cache[stage_key] = {}
-                if session_id not in self.client_cache[stage_key]:
-                    self.client_cache[stage_key][session_id] = []
-                self.client_cache[stage_key][session_id].append(cur.clone().cpu())  # 과거 입력 저장
-                
+            route = await self._get_route(session_id)
+
+            for stage_key, expect_hidden in route:
+                self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
+
                 stage_start = time.perf_counter()
-                serialized = serialize_torch_tensor(cur) # 1. Serialize Tensor
-                size = cur.element_size() * cur.nelement()
-                
-                # 복구 가능한 RPC 호출
+                serialized = serialize_torch_tensor(cur)
+
                 result = await self._call_stage_with_recovery(
                     stage_key,
                     [serialized],
@@ -713,15 +752,15 @@ class RpcTransport:
                     is_replay=False,
                     session_id=session_id,
                 )
-                # 통과한 스테이지 및 해당 스테이지의 maddrs 로그
+
                 info = self.remote_info.get(stage_key, {})
                 maddrs = info.get("maddrs") or []
-                logger.info(f"Prefill pass: stage_key={stage_key}, maddrs={maddrs}")
+                logger.info(f"Prefill pass: key={stage_key}, maddrs={maddrs}")
 
-                stage_times.append((stage_key, time.perf_counter() - stage_start)) # 4. Record time
-                if expect_hidden: # Not last stage
+                stage_times.append((stage_key, time.perf_counter() - stage_start))
+                if expect_hidden:
                     cur = result
-                else: # Last stage
+                else:
                     self.last_prefill_stage_times = stage_times
                     self.last_prefill_total = time.perf_counter() - start_all
                     return result
@@ -730,11 +769,16 @@ class RpcTransport:
             self.last_prefill_total = time.perf_counter() - start_all
             raise RuntimeError("No final stage returned a token")
 
-        # _last_token에 토큰 저장
         self._last_token = self._run_async(_send())
 
-    def send_decode_step(self, cur_len: int, hidden: torch.Tensor, session_id: str, max_length: int, generated_tokens: Optional[List[int]] = None):
-        """Send decode step hidden states through all remote stages."""
+    def send_decode_step(
+        self,
+        cur_len: int,
+        hidden: torch.Tensor,
+        session_id: str,
+        max_length: int,
+        generated_tokens: Optional[List[int]] = None,
+    ):
         if self.stage != 0:
             raise RuntimeError("send_decode_step should only be called by stage0")
 
@@ -745,31 +789,24 @@ class RpcTransport:
                 {
                     "session_id": session_id,
                     "seq_len": 1,
-                    "cur_len": cur_len,
+                    "cur_len": int(cur_len),
                     "is_prefill": False,
-                    "max_length": max_length,
-                    "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),  # 최근 50개 전달 (반복 체크 범위 확대)
+                    "max_length": int(max_length),
+                    "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),
                     **self.sampling,
                 }
             )
 
             cur = hidden_cpu
             stage_times: List[Tuple[str, float]] = []
-            for idx, stage_key in enumerate(self.stage_keys):
-                expect_hidden = idx < len(self.stage_keys) - 1
-                
-                # Client-side cache에 입력 저장 (fault tolerance, session별 관리)
-                if stage_key not in self.client_cache:
-                    self.client_cache[stage_key] = {}
-                if session_id not in self.client_cache[stage_key]:
-                    self.client_cache[stage_key][session_id] = []
-                self.client_cache[stage_key][session_id].append(cur.clone().cpu())  # 과거 입력 저장
-                
+            route = await self._get_route(session_id)
+
+            for stage_key, expect_hidden in route:
+                self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
+
                 stage_start = time.perf_counter()
                 serialized = serialize_torch_tensor(cur)
-                size = cur.element_size() * cur.nelement()
-                
-                # 복구 가능한 RPC 호출
+
                 result = await self._call_stage_with_recovery(
                     stage_key,
                     [serialized],
@@ -779,10 +816,10 @@ class RpcTransport:
                     is_replay=False,
                     session_id=session_id,
                 )
-                # 통과한 스테이지 및 해당 스테이지의 maddrs 로그
+
                 info = self.remote_info.get(stage_key, {})
                 maddrs = info.get("maddrs") or []
-                logger.info(f"Decode pass: stage_key={stage_key}, maddrs={maddrs}")
+                logger.info(f"Decode pass: key={stage_key}, maddrs={maddrs}")
 
                 stage_times.append((stage_key, time.perf_counter() - stage_start))
                 if expect_hidden:
@@ -795,8 +832,8 @@ class RpcTransport:
                     self.decode_total_times.append(total)
                     return result
 
-            self.last_decode_stage_times = stage_times
             total = time.perf_counter() - start_all
+            self.last_decode_stage_times = stage_times
             self.last_decode_total = total
             self.decode_stage_history.append(stage_times)
             self.decode_total_times.append(total)
@@ -804,30 +841,16 @@ class RpcTransport:
 
         self._last_token = self._run_async(_send())
 
-    def send_token(self, token_id: int):
-        """Send generated token to peer (stage1 -> stage0).
-
-        Note: In RPC mode, token is returned in the response, not sent separately.
-        This method is a no-op for RPC mode.
-        """
-        if self.stage != 1:
-            raise RuntimeError("send_token should only be called by stage1")
-        pass
-
     def recv_token(self) -> int:
-        """Receive token from peer (stage0 receives from stage1)."""
         if self.stage != 0:
             raise RuntimeError("recv_token should only be called by stage0")
-
         if self._last_token is None:
             raise RuntimeError("No token received. Call send_prefill or send_decode_step first.")
-
         token_id = self._last_token
         self._last_token = None
-        return token_id
+        return int(token_id)
 
     def shutdown(self):
-        """Shutdown P2P and DHT."""
         if self.p2p is not None:
             try:
                 self._run_async(self.p2p.shutdown())
