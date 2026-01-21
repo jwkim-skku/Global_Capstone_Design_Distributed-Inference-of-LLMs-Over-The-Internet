@@ -1,11 +1,26 @@
+import json
 import logging
-from typing import Optional, Tuple
+import os
+import shutil
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 from enum import Enum
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from huggingface_hub import hf_hub_download, HfApi
+
+logger = logging.getLogger(__name__)
+
+try:
+    from safetensors import safe_open
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+    # Don't warn here, will warn in function if needed
 
 from .utils import default_position_ids
 
@@ -18,7 +33,7 @@ class QuantType(Enum):
     NF4 = 2  # 4-bit as in the QLoRA paper
 
 
-def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
+def quantize_module(model: nn.Module, *, quant_type: QuantType, compute_dtype: Optional[torch.dtype] = None) -> nn.Module:
     """
     Quantize a model module by replacing Linear layers with quantized versions.
     This is based on the original Petals implementation.
@@ -26,6 +41,9 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     Args:
         model: The model module to quantize
         quant_type: Type of quantization (INT8 or NF4)
+        compute_dtype: Compute dtype for NF4 quantization (e.g., torch.float16).
+                      If None, uses default (torch.float32). Setting to float16
+                      matches input dtype and avoids warnings.
     
     Returns:
         The quantized model (modified in-place)
@@ -43,7 +61,7 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
     
     for n, module in model.named_children():
         if len(list(module.children())) > 0:
-            quantize_module(module, quant_type=quant_type)
+            quantize_module(module, quant_type=quant_type, compute_dtype=compute_dtype)
 
         # Skip critical projection layers used for KV cache correctness
         # q_proj / k_proj / v_proj / o_proj must stay in higher precision
@@ -51,16 +69,19 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
         skip_names = {"lm_head", "score"}  # , "q_proj", "k_proj", "v_proj", "o_proj"}  # Commented out to enable attention quantization
 
         if isinstance(module, torch.nn.Linear) and n not in skip_names:
-            # Ensure the module is on CPU before quantization
-            # Note: We load the model on CPU initially, so this should already be on CPU
-            if module.weight.device.type != "cpu":
-                # If somehow on GPU, move to CPU first
-                logger.warning(
-                    f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
-                )
-                # Move the actual module in the model
-                model._modules[n] = module.cpu()
-                module = model._modules[n]
+            # Check if weight is on meta device (from device_map="auto")
+            if hasattr(module, 'weight') and hasattr(module.weight, 'device'):
+                if module.weight.device.type == "meta":
+                    logger.warning(f"Linear layer '{n}' is on meta device, skipping quantization (will be loaded later)")
+                    continue
+                elif module.weight.device.type != "cpu":
+                    # If somehow on GPU, move to CPU first
+                    logger.warning(
+                        f"Linear layer '{n}' is on {module.weight.device}, moving to CPU for quantization"
+                    )
+                    # Move the actual module in the model
+                    model._modules[n] = module.cpu()
+                    module = model._modules[n]
             
             if quant_type == QuantType.INT8:
                 model._modules[n] = bnb.nn.Linear8bitLt(
@@ -75,12 +96,24 @@ def quantize_module(model: nn.Module, *, quant_type: QuantType) -> nn.Module:
                 ).to(module.weight.dtype)
             elif quant_type == QuantType.NF4:
                 compress_statistics = True
-                model._modules[n] = bnb.nn.LinearNF4(
-                    module.in_features,
-                    module.out_features,
-                    module.bias is not None,
-                    compress_statistics=compress_statistics,
-                )
+                # compute_dtype이 지정되지 않으면 기본값 사용 (기본값은 float32)
+                # float16으로 설정하면 입력 dtype과 일치하여 경고 방지 및 성능 향상
+                # LinearNF4는 위치 인자로 input_features, output_features를 받음
+                if compute_dtype is not None:
+                    model._modules[n] = bnb.nn.LinearNF4(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        compress_statistics=compress_statistics,
+                        compute_dtype=compute_dtype,
+                    )
+                else:
+                    model._modules[n] = bnb.nn.LinearNF4(
+                        module.in_features,
+                        module.out_features,
+                        bias=module.bias is not None,
+                        compress_statistics=compress_statistics,
+                    )
                 model._modules[n].weight = bnb.nn.Params4bit(
                     module.weight.data,
                     requires_grad=False,
@@ -269,18 +302,43 @@ class Stage0(nn.Module):
     def __init__(self, full, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in Stage0.")
+        # Support LLaMA, Mistral, Mixtral, and BLOOM models
+        is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
+        if not is_supported:
+            raise ValueError(f"Unsupported model type '{model_type}' in Stage0. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
+        
+        # Store model type for forward pass
+        self.is_bloom = "bloom" in model_type
+        
+        # For BLOOM models, store build_alibi_tensor function and num_heads
+        if self.is_bloom:
+            try:
+                from transformers.models.bloom.modeling_bloom import build_alibi_tensor
+                self.build_alibi_tensor = build_alibi_tensor
+                self.num_heads = getattr(full.config, "num_attention_heads", None)
+                if self.num_heads is None:
+                    logger.warning("BLOOM model config missing num_attention_heads, ALiBi generation may fail")
+            except ImportError:
+                logger.warning("Could not import build_alibi_tensor, ALiBi generation will be disabled")
+                self.build_alibi_tensor = None
+                self.num_heads = None
 
         if hasattr(full, "model") and hasattr(full.model, "embed_tokens"):
+            # LLaMA-style
             self.embed_tokens = full.model.embed_tokens
             raw_layers = full.model.layers  # already pruned in load_stage_model
         elif hasattr(full, "transformer") and hasattr(full.transformer, "wte"):
+            # GPT-2 style (with wte)
             self.embed_tokens = full.transformer.wte
             self.pos_embed = getattr(full.transformer, "wpe", None)
             raw_layers = full.transformer.h  # already pruned in load_stage_model
+        elif hasattr(full, "transformer") and hasattr(full.transformer, "word_embeddings"):
+            # BLOOM style (with word_embeddings)
+            self.embed_tokens = full.transformer.word_embeddings
+            self.pos_embed = None  # BLOOM doesn't have positional embeddings
+            raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported architecture: {type(full)}.")
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
@@ -310,22 +368,129 @@ class Stage0(nn.Module):
         x = self.embed_tokens(input_ids)
         cache_obj = None
         tuple_cache = []
+        
+        # For BLOOM models, attention_mask is required - create default if None
+        if self.is_bloom and attention_mask is None:
+            batch_size, seq_length = x.shape[:2]
+            # Calculate total sequence length including past
+            total_seq_length = seq_length
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Check first layer's past_key_value to get past length
+                first_past = past_key_values[0] if isinstance(past_key_values[0], (tuple, list)) else None
+                if first_past is not None and len(first_past) >= 1:
+                    past_key = first_past[0]
+                    if past_key is not None and past_key.ndim >= 3:
+                        total_seq_length += past_key.shape[2]
+            # Create default attention mask (all ones = no masking)
+            attention_mask = torch.ones(
+                (batch_size, total_seq_length),
+                device=x.device,
+                dtype=torch.bool
+            )
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM models don't accept position_ids or past_key_value parameters
+            # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
+            if self.is_bloom:
+                # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
+                # Generate ALiBi tensor for BLOOM
+                alibi = None
+                if self.build_alibi_tensor is not None and self.num_heads is not None:
+                    try:
+                        batch_size, seq_length = x.shape[:2]
+                        
+                        # Calculate total key length (current sequence + past if applicable)
+                        total_seq_length = seq_length
+                        if layer_past is not None:
+                            # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                                past_key = layer_past[0]
+                                if past_key is not None and past_key.ndim >= 3:
+                                    past_seq_len = past_key.shape[2]
+                                    total_seq_length += past_seq_len
+                        
+                        # Create or use attention_mask for ALiBi generation
+                        if attention_mask is not None:
+                            # attention_mask might be 2D (batch_size, seq_length) or 4D (batch_size, 1, 1, seq_length)
+                            # For ALiBi, we need 2D shape (batch_size, seq_length)
+                            if attention_mask.ndim == 4:
+                                alibi_attention_mask = attention_mask.squeeze(1).squeeze(1)  # (batch_size, seq_length)
+                            elif attention_mask.ndim == 2:
+                                alibi_attention_mask = attention_mask
+                            else:
+                                # Fallback: create a dummy mask
+                                alibi_attention_mask = torch.ones(
+                                    (batch_size, total_seq_length),
+                                    device=x.device,
+                                    dtype=torch.bool
+                                )
+                            
+                            # If attention_mask is shorter than total_seq_length, pad it
+                            if alibi_attention_mask.shape[1] < total_seq_length:
+                                # Pad with ones (assuming past tokens are valid)
+                                padding = torch.ones(
+                                    (batch_size, total_seq_length - alibi_attention_mask.shape[1]),
+                                    device=x.device,
+                                    dtype=alibi_attention_mask.dtype
+                                )
+                                alibi_attention_mask = torch.cat([padding, alibi_attention_mask], dim=1)
+                            elif alibi_attention_mask.shape[1] > total_seq_length:
+                                # Truncate to total_seq_length (shouldn't happen, but handle it)
+                                alibi_attention_mask = alibi_attention_mask[:, -total_seq_length:]
+                        else:
+                            # No attention_mask provided, create a dummy one
+                            alibi_attention_mask = torch.ones(
+                                (batch_size, total_seq_length),
+                                device=x.device,
+                                dtype=torch.bool
+                            )
+                        
+                        # build_alibi_tensor(attention_mask, num_heads, dtype)
+                        alibi = self.build_alibi_tensor(
+                            alibi_attention_mask,
+                            self.num_heads,
+                            dtype=x.dtype,
+                        )
+                        # Move alibi to correct device
+                        alibi = alibi.to(x.device)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        import traceback
+                        logger.debug(f"ALiBi generation traceback: {traceback.format_exc()}")
+                        alibi = None
+                
+                # Build kwargs dict
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "alibi": alibi,
+                    "use_cache": use_cache,
+                    "output_attentions": False,
+                }
+                # Add layer_past only if it's not None
+                if layer_past is not None:
+                    layer_kwargs["layer_past"] = layer_past
+                
+                # Filter out None values from kwargs
+                layer_kwargs = {k: v for k, v in layer_kwargs.items() if v is not None}
+                
+                out = layer(x, **layer_kwargs)
+            else:
+                # LLaMA/Mistral/Mixtral: use standard forward with position_ids
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                # Use standard layer forward
+                # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -374,8 +539,10 @@ class StageSegment(nn.Module):
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageSegment.")
+        # Support LLaMA, Mistral, Mixtral, and BLOOM models
+        is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
+        if not is_supported:
+            raise ValueError(f"Unsupported model type '{model_type}' in StageSegment. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -386,6 +553,22 @@ class StageSegment(nn.Module):
 
         self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
+        self.is_bloom = "bloom" in model_type
+        
+        # For BLOOM models, we need to prepare ALiBi generation
+        if self.is_bloom:
+            try:
+                from transformers.models.bloom.modeling_bloom import build_alibi_tensor
+                self.build_alibi_tensor = build_alibi_tensor
+                # Get number of heads from config
+                self.num_heads = getattr(full.config, "num_attention_heads", None)
+                if self.num_heads is None:
+                    logger.warning("Could not determine num_attention_heads for BLOOM model, ALiBi generation may fail")
+            except ImportError:
+                logger.warning("Could not import build_alibi_tensor from transformers, ALiBi generation may fail")
+                self.build_alibi_tensor = None
+                self.num_heads = None
+        
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
@@ -395,12 +578,13 @@ class StageSegment(nn.Module):
                 optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
                 logger.info(
                     f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer, "
+                    f"model_type={model_type}"
                 )
             else:
                 logger.info(
                     f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized"
+                    f"{quantized_layers} quantized, model_type={model_type}"
                 )
 
     def forward(
@@ -413,22 +597,129 @@ class StageSegment(nn.Module):
     ):
         x = hidden_states
         tuple_cache = []
+        
+        # For BLOOM models, attention_mask is required - create default if None
+        if self.is_bloom and attention_mask is None:
+            batch_size, seq_length = x.shape[:2]
+            # Calculate total sequence length including past
+            total_seq_length = seq_length
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Check first layer's past_key_value to get past length
+                first_past = past_key_values[0] if isinstance(past_key_values[0], (tuple, list)) else None
+                if first_past is not None and len(first_past) >= 1:
+                    past_key = first_past[0]
+                    if past_key is not None and past_key.ndim >= 3:
+                        total_seq_length += past_key.shape[2]
+            # Create default attention mask (all ones = no masking)
+            attention_mask = torch.ones(
+                (batch_size, total_seq_length),
+                device=x.device,
+                dtype=torch.bool
+            )
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM models don't accept position_ids or past_key_value parameters
+            # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
+            if self.is_bloom:
+                # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
+                # Generate ALiBi tensor for BLOOM
+                # build_alibi_tensor signature: build_alibi_tensor(attention_mask, num_heads, dtype)
+                # attention_mask must be a tensor of shape (batch_size, seq_length)
+                alibi = None
+                if self.build_alibi_tensor is not None and self.num_heads is not None:
+                    try:
+                        batch_size, seq_length = x.shape[:2]
+                        
+                        # Calculate total key length (current sequence + past if applicable)
+                        total_seq_length = seq_length
+                        if layer_past is not None:
+                            # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                                past_key = layer_past[0]
+                                if past_key is not None and past_key.ndim >= 3:
+                                    past_seq_len = past_key.shape[2]
+                                    total_seq_length += past_seq_len
+                        
+                        # Create or use attention_mask for ALiBi generation
+                        # If attention_mask is provided, use it (should already have correct shape)
+                        # Otherwise, create a dummy one with shape (batch_size, total_seq_length)
+                        if attention_mask is not None:
+                            # attention_mask might be 2D (batch_size, seq_length) or 4D (batch_size, 1, 1, seq_length)
+                            # For ALiBi, we need 2D shape (batch_size, seq_length)
+                            if attention_mask.ndim == 4:
+                                # Extract the last dimension
+                                alibi_attention_mask = attention_mask.squeeze(1).squeeze(1)  # (batch_size, seq_length)
+                            elif attention_mask.ndim == 2:
+                                alibi_attention_mask = attention_mask
+                            else:
+                                # Fallback: create a dummy mask
+                                alibi_attention_mask = torch.ones(
+                                    (batch_size, total_seq_length),
+                                    device=x.device,
+                                    dtype=torch.bool
+                                )
+                            
+                            # If attention_mask is shorter than total_seq_length, pad it
+                            if alibi_attention_mask.shape[1] < total_seq_length:
+                                # Pad with ones (assuming past tokens are valid)
+                                padding = torch.ones(
+                                    (batch_size, total_seq_length - alibi_attention_mask.shape[1]),
+                                    device=x.device,
+                                    dtype=alibi_attention_mask.dtype
+                                )
+                                alibi_attention_mask = torch.cat([padding, alibi_attention_mask], dim=1)
+                            elif alibi_attention_mask.shape[1] > total_seq_length:
+                                # Truncate to total_seq_length (shouldn't happen, but handle it)
+                                alibi_attention_mask = alibi_attention_mask[:, -total_seq_length:]
+                        else:
+                            # No attention_mask provided, create a dummy one
+                            alibi_attention_mask = torch.ones(
+                                (batch_size, total_seq_length),
+                                device=x.device,
+                                dtype=torch.bool
+                            )
+                        
+                        # build_alibi_tensor(attention_mask, num_heads, dtype)
+                        # attention_mask: (batch_size, seq_length) tensor
+                        # num_heads: int
+                        # dtype: torch.dtype
+                        alibi = self.build_alibi_tensor(
+                            alibi_attention_mask,
+                            self.num_heads,
+                            dtype=x.dtype,
+                        )
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        import traceback
+                        logger.debug(f"ALiBi generation traceback: {traceback.format_exc()}")
+                        alibi = None
+                
+                # Build kwargs dict
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "alibi": alibi,
+                    "use_cache": use_cache,
+                    "output_attentions": False,
+                }
+                # Add layer_past only if it's not None
+                if layer_past is not None:
+                    layer_kwargs["layer_past"] = layer_past
+                out = layer(x, **layer_kwargs)
+            else:
+                # LLaMA/Mistral/Mixtral: pass position_ids
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -471,8 +762,26 @@ class StageLast(nn.Module):
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageLast.")
+        # Support LLaMA, Mistral, Mixtral, and BLOOM models
+        is_supported = ("llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "bloom" in model_type)
+        if not is_supported:
+            raise ValueError(f"Unsupported model type '{model_type}' in StageLast. Supported: LLaMA, Mistral, Mixtral, BLOOM.")
+        
+        # Store model type for forward pass
+        self.is_bloom = "bloom" in model_type
+        
+        # For BLOOM models, store build_alibi_tensor function and num_heads
+        if self.is_bloom:
+            try:
+                from transformers.models.bloom.modeling_bloom import build_alibi_tensor
+                self.build_alibi_tensor = build_alibi_tensor
+                self.num_heads = getattr(full.config, "num_attention_heads", None)
+                if self.num_heads is None:
+                    logger.warning("BLOOM model config missing num_attention_heads, ALiBi generation may fail")
+            except ImportError:
+                logger.warning("Could not import build_alibi_tensor, ALiBi generation will be disabled")
+                self.build_alibi_tensor = None
+                self.num_heads = None
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -516,22 +825,137 @@ class StageLast(nn.Module):
     ):
         x = hidden_states
         tuple_cache = []
+        
+        # For BLOOM models, attention_mask is required - create default if None
+        if self.is_bloom and attention_mask is None:
+            batch_size, seq_length = x.shape[:2]
+            # Calculate total sequence length including past
+            total_seq_length = seq_length
+            if past_key_values is not None and len(past_key_values) > 0:
+                # Check first layer's past_key_value to get past length
+                first_past = past_key_values[0] if isinstance(past_key_values[0], (tuple, list)) else None
+                if first_past is not None and len(first_past) >= 1:
+                    past_key = first_past[0]
+                    if past_key is not None and past_key.ndim >= 3:
+                        total_seq_length += past_key.shape[2]
+            # Create default attention mask (all ones = no masking)
+            attention_mask = torch.ones(
+                (batch_size, total_seq_length),
+                device=x.device,
+                dtype=torch.bool
+            )
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM models don't accept position_ids or past_key_value parameters
+            # BLOOM uses layer_past instead and requires alibi for ALiBi (Attention with Linear Biases)
+            if self.is_bloom:
+                # BLOOM: pass attention_mask, alibi, layer_past, and use_cache
+                # Generate ALiBi tensor for BLOOM
+                # build_alibi_tensor signature: build_alibi_tensor(attention_mask, num_heads, dtype)
+                # attention_mask must be a tensor of shape (batch_size, seq_length)
+                alibi = None
+                if self.build_alibi_tensor is not None and self.num_heads is not None:
+                    try:
+                        batch_size, seq_length = x.shape[:2]
+                        
+                        # Calculate total key length (current sequence + past if applicable)
+                        total_seq_length = seq_length
+                        if layer_past is not None:
+                            # layer_past is tuple of (key, value), key shape is [batch, num_heads, past_seq_len, head_dim]
+                            if isinstance(layer_past, (tuple, list)) and len(layer_past) >= 1:
+                                past_key = layer_past[0]
+                                if past_key is not None and past_key.ndim >= 3:
+                                    past_seq_len = past_key.shape[2]
+                                    total_seq_length += past_seq_len
+                        
+                        # Create or use attention_mask for ALiBi generation
+                        # If attention_mask is provided, use it (should already have correct shape)
+                        # Otherwise, create a dummy one with shape (batch_size, total_seq_length)
+                        if attention_mask is not None:
+                            # attention_mask might be 2D (batch_size, seq_length) or 4D (batch_size, 1, 1, seq_length)
+                            # For ALiBi, we need 2D shape (batch_size, seq_length)
+                            if attention_mask.ndim == 4:
+                                # Extract the last dimension
+                                alibi_attention_mask = attention_mask.squeeze(1).squeeze(1)  # (batch_size, seq_length)
+                            elif attention_mask.ndim == 2:
+                                alibi_attention_mask = attention_mask
+                            else:
+                                # Fallback: create a dummy mask
+                                alibi_attention_mask = torch.ones(
+                                    (batch_size, total_seq_length),
+                                    device=x.device,
+                                    dtype=torch.bool
+                                )
+                            
+                            # If attention_mask is shorter than total_seq_length, pad it
+                            if alibi_attention_mask.shape[1] < total_seq_length:
+                                # Pad with ones (assuming past tokens are valid)
+                                padding = torch.ones(
+                                    (batch_size, total_seq_length - alibi_attention_mask.shape[1]),
+                                    device=x.device,
+                                    dtype=alibi_attention_mask.dtype
+                                )
+                                alibi_attention_mask = torch.cat([padding, alibi_attention_mask], dim=1)
+                            elif alibi_attention_mask.shape[1] > total_seq_length:
+                                # Truncate to total_seq_length (shouldn't happen, but handle it)
+                                alibi_attention_mask = alibi_attention_mask[:, -total_seq_length:]
+                        else:
+                            # No attention_mask provided, create a dummy one
+                            alibi_attention_mask = torch.ones(
+                                (batch_size, total_seq_length),
+                                device=x.device,
+                                dtype=torch.bool
+                            )
+                        
+                        # build_alibi_tensor(attention_mask, num_heads, dtype)
+                        # attention_mask: (batch_size, seq_length) tensor
+                        # num_heads: int
+                        # dtype: torch.dtype
+                        alibi = self.build_alibi_tensor(
+                            alibi_attention_mask,
+                            self.num_heads,
+                            dtype=x.dtype,
+                        )
+                        # Move alibi to correct device
+                        alibi = alibi.to(x.device)
+                        
+                    except Exception as e:
+                        logger.warning(f"Failed to build ALiBi tensor: {e}, using None")
+                        import traceback
+                        logger.debug(f"ALiBi generation traceback: {traceback.format_exc()}")
+                        alibi = None
+                
+                # Build kwargs dict
+                layer_kwargs = {
+                    "attention_mask": attention_mask,
+                    "alibi": alibi,
+                    "use_cache": use_cache,
+                    "output_attentions": False,
+                }
+                # Add layer_past only if it's not None
+                if layer_past is not None:
+                    layer_kwargs["layer_past"] = layer_past
+                
+                # Filter out None values from kwargs
+                layer_kwargs = {k: v for k, v in layer_kwargs.items() if v is not None}
+                
+                out = layer(x, **layer_kwargs)
+            else:
+                # LLaMA/Mistral/Mixtral: use standard forward with position_ids
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                # Use standard layer forward
+                # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -574,6 +998,252 @@ class StageLast(nn.Module):
         return logits, tuple(tuple_cache)
 
 
+def _create_stage_config(config: PretrainedConfig, role: str, start: int, end: Optional[int]) -> PretrainedConfig:
+    """
+    Create a modified config with only the required number of layers.
+    This reduces memory usage when creating model structure.
+    
+    Args:
+        config: Original model config
+        role: Stage role ("stage0", "segment", "last")
+        start: Start layer index
+        end: End layer index (None for "last")
+    
+    Returns:
+        Modified config with reduced num_hidden_layers
+    """
+    # Config 복사
+    stage_config = config.__class__(**config.to_dict())
+    
+    # 필요한 레이어 수 계산
+    if role == "stage0":
+        num_layers_needed = end
+    elif role == "segment":
+        num_layers_needed = end - start
+    elif role == "last":
+        num_layers_needed = config.num_hidden_layers - start
+    else:
+        num_layers_needed = config.num_hidden_layers
+    
+    # num_hidden_layers 수정 (메모리 절약을 위해 작은 구조 생성)
+    stage_config.num_hidden_layers = num_layers_needed
+    
+    logger.info(f"Created stage config: role={role}, original_layers={config.num_hidden_layers}, "
+                f"stage_layers={num_layers_needed}, start={start}, end={end}")
+    
+    return stage_config
+
+
+def _remap_state_dict_keys(state_dict: Dict[str, torch.Tensor], role: str, start: int, end: Optional[int]) -> Dict[str, torch.Tensor]:
+    """
+    Remap state_dict keys to match the smaller model structure.
+    
+    For segment/last roles, layer indices need to be remapped:
+    - Original: model.layers.10.* -> Remapped: model.layers.0.*
+    - Original: model.layers.11.* -> Remapped: model.layers.1.*
+    etc.
+    
+    Args:
+        state_dict: Original state_dict with full layer indices
+        role: Stage role ("stage0", "segment", "last")
+        start: Start layer index in original model
+        end: End layer index in original model
+    
+    Returns:
+        Remapped state_dict with layer indices starting from 0
+    """
+    remapped = {}
+    
+    for key, value in state_dict.items():
+        new_key = key
+        
+        # BLOOM 모델 키 처리: h.{layer_idx}.* 형식
+        if key.startswith("h."):
+            parts = key.split(".")
+            if len(parts) >= 2:
+                try:
+                    layer_idx = int(parts[1])
+                    if role == "stage0":
+                        # stage0는 0부터 시작하므로 prefix만 추가
+                        new_key = f"transformer.h.{layer_idx}." + ".".join(parts[2:])
+                    elif role == "segment" or role == "last":
+                        # segment/last는 인덱스를 0부터 시작하도록 재매핑
+                        if layer_idx >= start:
+                            new_layer_idx = layer_idx - start
+                            new_key = f"transformer.h.{new_layer_idx}." + ".".join(parts[2:])
+                        else:
+                            continue  # Skip keys before start
+                except ValueError:
+                    pass
+        elif key.startswith("word_embeddings"):
+            # BLOOM embedding
+            if role == "stage0":
+                new_key = "transformer." + key
+        elif key.startswith("model.layers."):
+            # LLaMA 모델 키 처리
+            if role == "segment" or role == "last":
+                parts = key.split(".")
+                if len(parts) >= 3:
+                    try:
+                        layer_idx = int(parts[2])
+                        if layer_idx >= start:
+                            new_layer_idx = layer_idx - start
+                            new_key = f"model.layers.{new_layer_idx}." + ".".join(parts[3:])
+                    except ValueError:
+                        pass
+        
+        remapped[new_key] = value
+    
+    return remapped
+
+
+def _get_required_tensor_keys(role: str, start: int, end: Optional[int], config) -> Set[str]:
+    """
+    Get the set of tensor key prefixes required for a given stage.
+    Returns a set of tensor key prefixes that need to be loaded.
+    Supports both LLaMA-style (model.layers) and BLOOM-style (transformer.h) architectures.
+    """
+    required_prefixes = set()
+    num_layers = config.num_hidden_layers
+    
+    # Detect model architecture from config
+    model_type = getattr(config, "model_type", "").lower()
+    is_bloom = "bloom" in model_type
+    is_llama = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type
+    
+    # Determine layer prefix based on architecture
+    if is_bloom:
+        # BLOOM model uses "h.0." format (without "transformer." prefix in weight_map)
+        layer_prefix = "h."
+        embed_prefix = "word_embeddings"
+        norm_prefix = "ln_f"
+        head_prefix = "lm_head"
+    elif is_llama:
+        layer_prefix = "model.layers."
+        embed_prefix = "model.embed_tokens"
+        norm_prefix = "model.norm"
+        head_prefix = "lm_head"
+    else:
+        # Default to LLaMA-style (backward compatibility)
+        layer_prefix = "model.layers."
+        embed_prefix = "model.embed_tokens"
+        norm_prefix = "model.norm"
+        head_prefix = "lm_head"
+        logger.warning(f"Unknown model type '{model_type}', assuming LLaMA-style architecture")
+    
+    # Embedding layers
+    if role == "stage0":
+        required_prefixes.add(embed_prefix)
+        # Layers from 0 to end
+        for i in range(end):
+            required_prefixes.add(f"{layer_prefix}{i}.")
+    elif role == "segment":
+        # Layers from start to end
+        for i in range(start, end):
+            required_prefixes.add(f"{layer_prefix}{i}.")
+    elif role == "last":
+        # Layers from start to end
+        for i in range(start, num_layers):
+            required_prefixes.add(f"{layer_prefix}{i}.")
+        required_prefixes.add(norm_prefix)
+        required_prefixes.add(head_prefix)
+    
+    logger.info(f"Detected model type: {model_type}, using layer prefix: {layer_prefix}")
+    return required_prefixes
+
+
+def _load_selective_weights(
+    model_name: str,
+    required_keys: Set[str],
+    cache_dir: Optional[str] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Load only the required weights from sharded safetensors files.
+    Returns a state_dict with only the required tensors.
+    """
+    if not SAFETENSORS_AVAILABLE:
+        raise ImportError("safetensors is required for selective loading")
+    
+    try:
+        from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME
+    except ImportError:
+        SAFE_WEIGHTS_INDEX_NAME = "model.safetensors.index.json"
+        SAFE_WEIGHTS_NAME = "model.safetensors"
+    
+    api = HfApi()
+    
+    # Try to get index file
+    try:
+        index_path = hf_hub_download(
+            repo_id=model_name,
+            filename=SAFE_WEIGHTS_INDEX_NAME,
+            cache_dir=cache_dir,
+        )
+        
+        with open(index_path, 'r') as f:
+            index_data = json.load(f)
+        
+        weight_map = index_data.get("weight_map", {})
+        state_dict = {}
+        
+        # Debug: Log a few example keys from weight_map
+        sample_keys = list(weight_map.keys())[:5]
+        logger.info(f"Sample tensor keys from weight_map: {sample_keys}")
+        logger.info(f"Required prefixes: {sorted(list(required_keys))[:10]}...")
+        
+        # Find which shard files contain our required keys
+        shard_files = set()
+        matched_keys = []
+        for tensor_key, shard_file in weight_map.items():
+            # Match keys that start with any required prefix
+            for req_prefix in required_keys:
+                if tensor_key.startswith(req_prefix):
+                    shard_files.add(shard_file)
+                    if len(matched_keys) < 10:  # Log first 10 matches for debugging
+                        matched_keys.append((tensor_key, shard_file))
+                    break
+        
+        if matched_keys:
+            logger.info(f"Found {len(shard_files)} shard files with matching keys")
+            logger.info(f"Sample matched keys: {matched_keys[:5]}")
+        else:
+            logger.warning(f"No matching keys found! This may indicate a key format mismatch.")
+            logger.warning(f"First few weight_map keys: {list(weight_map.keys())[:10]}")
+        
+        shard_files = sorted(shard_files)  # 정렬하여 일관된 순서 보장
+        total_shards = len(shard_files)
+        logger.info(f"Selective loading: {total_shards} shard files needed for {len(required_keys)} required prefixes")
+        logger.info(f"Selective loading: Starting download of {total_shards} shard files...")
+        
+        # Download and load only required shard files
+        for idx, shard_file in enumerate(shard_files, 1):
+            logger.info(f"Selective loading: Downloading shard {idx}/{total_shards}: {shard_file}")
+            shard_path = hf_hub_download(
+                repo_id=model_name,
+                filename=shard_file,
+                cache_dir=cache_dir,
+            )
+            logger.info(f"Selective loading: Shard {idx}/{total_shards} downloaded/loaded from cache: {shard_path}")
+            
+            logger.info(f"Selective loading: Loading tensors from shard {idx}/{total_shards}...")
+            tensors_loaded_from_shard = 0
+            with safe_open(shard_path, framework="pt", device="cpu") as f:
+                for tensor_key in f.keys():
+                    # Check if this tensor is needed (matches any required prefix)
+                    if any(tensor_key.startswith(req_prefix) for req_prefix in required_keys):
+                        state_dict[tensor_key] = f.get_tensor(tensor_key)
+                        tensors_loaded_from_shard += 1
+            logger.info(f"Selective loading: Loaded {tensors_loaded_from_shard} tensors from shard {idx}/{total_shards}")
+        
+        logger.info(f"Selective loading: Completed! Loaded {len(state_dict)} total tensors from {total_shards} shard files")
+        return state_dict
+        
+    except Exception as e:
+        logger.warning(f"Selective loading failed: {e}, falling back to full download")
+        # Fallback: return empty dict to trigger full download
+        return {}
+
+
 def load_stage_model(
     model_name: str,
     device: torch.device,
@@ -583,6 +1253,7 @@ def load_stage_model(
     end: Optional[int] = None,
     dtype=torch.float16,
     quant_type: QuantType = QuantType.NONE,
+    use_selective_loading: bool = True,  # Enabled: uses modified config to prevent OOM
 ):
     """
     Load only the layers needed for a stage to reduce memory (LLaMA-only).
@@ -592,25 +1263,255 @@ def load_stage_model(
       - 'last': keep layers[start:], norm, lm_head
     quant_type: Quantization type (QuantType.NONE, QuantType.INT8, or QuantType.NF4)
                 If quantization is enabled, model will be loaded on CPU, quantized, then moved to device
+    use_selective_loading: If True, try to download only required layers (requires safetensors)
     """
-    # Always load model on CPU first (required for quantization, and safe for normal loading)
-    # Try device_map="cpu" first, fallback to manual CPU loading if not supported
-    try:
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-            device_map="cpu"  # Explicitly load on CPU for quantization compatibility
-        )
-    except TypeError:
-        # Fallback for older transformers versions that don't support device_map="cpu"
-        logger.warning("device_map='cpu' not supported, loading model and moving to CPU manually")
-        full = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=dtype,
-            low_cpu_mem_usage=True,
-        )
-        full = full.cpu()
+    # Load config first (always needed)
+    config = AutoConfig.from_pretrained(model_name)
+    
+    # Try selective loading if enabled and safetensors is available
+    selective_state_dict = None
+    if use_selective_loading and SAFETENSORS_AVAILABLE:
+        try:
+            required_keys = _get_required_tensor_keys(role, start, end, config)
+            logger.info(f"Attempting selective loading for {len(required_keys)} required keys")
+            selective_state_dict = _load_selective_weights(model_name, required_keys)
+            
+            if not selective_state_dict:
+                logger.info("Selective loading returned empty dict, falling back to full download")
+                selective_state_dict = None
+        except Exception as e:
+            logger.warning(f"Selective loading failed: {e}, falling back to full download")
+            selective_state_dict = None
+    
+    # If selective loading failed or is disabled, use full download
+    if selective_state_dict is None:
+        logger.info("Loading full model (will prune after loading)")
+        # Always load model on CPU first (required for quantization, and safe for normal loading)
+        # For large models like BLOOM-176B, use memory limits and disk offloading
+        import psutil
+        import tempfile
+        import shutil
+        
+        available_memory = psutil.virtual_memory().available
+        # BLOOM-176B는 매우 크므로 더 보수적으로 사용 가능한 메모리의 25%만 사용
+        # 전체 모델 로딩 중에는 더 많은 메모리가 필요하므로 더 낮게 설정
+        # 사용 가능한 메모리의 25%를 사용하되, 최소 80GB는 보장
+        min_required_mb = 80 * 1024  # 최소 80GB (더 보수적으로)
+        calculated_mb = int(available_memory * 0.25 / (1024 * 1024))
+        max_memory_mb = max(min_required_mb, calculated_mb)
+        max_memory = {"cpu": f"{max_memory_mb}MiB"}
+        logger.info(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (25% of available)")
+        
+        # 디스크 오프로딩을 위한 임시 디렉토리 생성
+        offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+        logger.info(f"Using disk offloading folder: {offload_folder}")
+        
+        try:
+            # Try device_map="cpu" first, fallback to manual CPU loading if not supported
+            try:
+                # Use accelerate's device_map="auto" with max_memory for better memory management
+                # This allows automatic offloading to disk when memory is constrained
+                # Use device_map="cpu" directly to avoid meta tensor issues
+                # device_map="auto" can leave some tensors on meta device which causes issues with quantization
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu",  # Explicitly load on CPU for quantization compatibility
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+                )
+            except TypeError:
+                # Fallback for older transformers versions that don't support device_map
+                logger.warning("device_map not supported, loading model and moving to CPU manually")
+                full = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    cache_dir=os.environ.get("HF_HOME") or os.environ.get("TRANSFORMERS_CACHE") or None,
+                    use_safetensors=True,
+                )
+                full = full.cpu()
+        except Exception as e:
+            # 오프로딩 폴더 정리
+            try:
+                shutil.rmtree(offload_folder)
+            except:
+                pass
+            raise e
+    else:
+        # Build model structure with selective weights
+        logger.info("Building model structure with selectively loaded weights")
+        
+        # Create a modified config with only required layers (OOM 방지)
+        logger.info("Step 1/4: Creating stage config...")
+        stage_config = _create_stage_config(config, role, start, end)
+        logger.info("Step 1/4: Stage config created successfully")
+        
+        # Create model structure with smaller config (메모리 절약)
+        # Use init_empty_weights to create structure without allocating weights (more memory efficient)
+        logger.info("Step 2/4: Creating model structure from config (this may take a while)...")
+        try:
+            from accelerate import init_empty_weights
+            with init_empty_weights():
+                full = AutoModelForCausalLM.from_config(stage_config)
+            logger.info("Step 2/4: Model structure created successfully (empty weights)")
+        except ImportError:
+            # Fallback if accelerate is not available
+            logger.warning("accelerate not available, using regular from_config (may use more memory)")
+            full = AutoModelForCausalLM.from_config(stage_config)
+            logger.info("Step 2/4: Model structure created successfully")
+        
+        # Remap state_dict keys to match the smaller model structure
+        # (segment/last의 경우 layer indices를 0부터 시작하도록 재매핑)
+        logger.info("Step 3/4: Remapping state_dict keys to match model structure...")
+        remapped_state_dict = _remap_state_dict_keys(selective_state_dict, role, start, end)
+        logger.info(f"Step 3/4: Remapped {len(remapped_state_dict)} tensor keys")
+        
+        # Load only the required weights
+        # Use assign=True when loading into meta device tensors (from init_empty_weights)
+        logger.info("Step 4/4: Loading weights into model structure (this may take a while)...")
+        try:
+            # Try with assign=True first (for meta device tensors from init_empty_weights)
+            # assign=True materializes meta tensors and assigns values directly
+            missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False, assign=True)
+            logger.info("Step 4/4: Weights loaded successfully (using assign=True for meta tensors)")
+            
+            # After assign=True, verify that all tensors are materialized
+            # If still on meta, try manual materialization
+            try:
+                sample_param = next(full.parameters())
+                if sample_param.device.type == "meta":
+                    logger.warning("Tensors still on meta device after assign=True, attempting manual materialization...")
+                    # assign=True should have worked, but if not, we need to manually materialize
+                    # This should not happen, but handle it gracefully
+            except StopIteration:
+                pass
+        except TypeError:
+            # Fallback if assign parameter is not supported (older PyTorch versions)
+            logger.warning("assign=True not supported, trying without assign parameter")
+            missing_keys, unexpected_keys = full.load_state_dict(remapped_state_dict, strict=False)
+            logger.info("Step 4/4: Weights loaded successfully")
+        
+        if missing_keys:
+            logger.warning(f"Missing keys in selective loading: {len(missing_keys)} keys")
+            logger.debug(f"First 10 missing keys: {missing_keys[:10]}")
+        if unexpected_keys:
+            logger.warning(f"Unexpected keys in selective loading: {len(unexpected_keys)} keys")
+        
+        # Move to CPU and set dtype
+        # After assign=True, check if ANY tensors are still on meta device
+        # We need to check ALL parameters and buffers, not just the first one
+        has_meta = False
+        try:
+            # Check all parameters for meta device
+            for param in full.parameters():
+                if param.device.type == "meta":
+                    has_meta = True
+                    break
+            # Also check buffers
+            if not has_meta:
+                for buffer in full.buffers():
+                    if buffer.device.type == "meta":
+                        has_meta = True
+                        break
+        except StopIteration:
+            pass
+        
+        if has_meta:
+            # Still on meta device, need to materialize manually using accelerate
+            logger.warning("Model still has meta tensors after load_state_dict, materializing to CPU...")
+            from accelerate.utils import set_module_tensor_to_device
+            
+            # Recursively materialize all parameters and buffers
+            def materialize_module(module, prefix=""):
+                materialized_count = 0
+                # Materialize parameters
+                for name, param in module.named_parameters(recurse=False):
+                    full_name = f"{prefix}.{name}" if prefix else name
+                    if param.device.type == "meta":
+                        # Find corresponding tensor in state_dict
+                        if full_name in remapped_state_dict:
+                            tensor = remapped_state_dict[full_name]
+                            set_module_tensor_to_device(module, name, "cpu", value=tensor)
+                            materialized_count += 1
+                        else:
+                            # If not in state_dict, create empty tensor on CPU with same shape/dtype
+                            try:
+                                # Get shape and dtype from meta tensor
+                                shape = param.shape
+                                dtype = param.dtype
+                                empty_tensor = torch.zeros(shape, dtype=dtype, device="cpu")
+                                set_module_tensor_to_device(module, name, "cpu", value=empty_tensor)
+                                materialized_count += 1
+                            except Exception as e:
+                                logger.debug(f"Failed to create empty tensor for {full_name}: {e}")
+                
+                # Materialize buffers
+                for name, buffer in module.named_buffers(recurse=False):
+                    full_name = f"{prefix}.{name}" if prefix else name
+                    if buffer.device.type == "meta":
+                        # Find corresponding tensor in state_dict
+                        if full_name in remapped_state_dict:
+                            tensor = remapped_state_dict[full_name]
+                            set_module_tensor_to_device(module, name, "cpu", value=tensor)
+                            materialized_count += 1
+                        else:
+                            # If not in state_dict, create empty tensor on CPU with same shape/dtype
+                            try:
+                                shape = buffer.shape
+                                dtype = buffer.dtype
+                                empty_tensor = torch.zeros(shape, dtype=dtype, device="cpu")
+                                set_module_tensor_to_device(module, name, "cpu", value=empty_tensor)
+                                materialized_count += 1
+                            except Exception as e:
+                                logger.debug(f"Failed to create empty buffer for {full_name}: {e}")
+                
+                # Recursively process child modules
+                for child_name, child_module in module.named_children():
+                    child_prefix = f"{prefix}.{child_name}" if prefix else child_name
+                    materialized_count += materialize_module(child_module, child_prefix)
+                
+                return materialized_count
+            
+            materialized_count = materialize_module(full)
+            logger.info(f"Materialized {materialized_count} tensors from meta to CPU")
+            
+            # Verify all tensors are now on CPU (not meta) - check ALL parameters and buffers
+            has_meta_after = False
+            try:
+                for param in full.parameters():
+                    if param.device.type == "meta":
+                        has_meta_after = True
+                        logger.warning(f"Parameter still on meta after materialization: {list(param.shape)}")
+                        break
+                if not has_meta_after:
+                    for buffer in full.buffers():
+                        if buffer.device.type == "meta":
+                            has_meta_after = True
+                            logger.warning(f"Buffer still on meta after materialization: {list(buffer.shape)}")
+                            break
+            except StopIteration:
+                pass
+            
+            if has_meta_after:
+                logger.error("Some tensors are still on meta device after materialization! Cannot proceed.")
+                raise RuntimeError("Failed to materialize all meta tensors to CPU. Some tensors remain on meta device.")
+            else:
+                logger.info("All tensors successfully materialized to CPU")
+                # Now safe to move to CPU (though they should already be on CPU)
+                full = full.cpu()
+        else:
+            # Normal case: no meta tensors, move to CPU
+            full = full.cpu()
+        
+        if dtype is not None:
+            full = full.to(dtype)
+    
     try:
         full.config.use_cache = True
     except Exception:
@@ -625,23 +1526,49 @@ def load_stage_model(
         else:
             raise ValueError(f"Unsupported model architecture for pruning: {type(obj)}")
 
-    if role == "stage0":
-        _prune_layers(full, 0, end)
-        if hasattr(full, "lm_head"):
-            full.lm_head = None
-        if hasattr(full, "model") and hasattr(full.model, "norm"):
-            full.model.norm = None
-    elif role == "segment":
-        _prune_layers(full, start, end)
-        if hasattr(full, "lm_head"):
-            full.lm_head = None
-        if hasattr(full, "model") and hasattr(full.model, "norm"):
-            full.model.norm = None
-    elif role == "last":
-        _prune_layers(full, start, None)
-        # keep norm/head
+    # Pruning: 선택적 로딩을 사용한 경우 이미 작은 구조이므로 인덱스 조정 필요
+    if selective_state_dict is not None:
+        # 선택적 로딩 사용: 이미 작은 구조이므로 모든 레이어 유지 (pruning 불필요)
+        # 하지만 role에 따라 불필요한 부분 제거는 여전히 필요
+        if role == "stage0":
+            # Stage0: 모든 레이어 유지 (이미 작은 구조)
+            pass  # layers[0:end]는 이미 작은 구조에 포함됨
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "segment":
+            # Segment: 모든 레이어 유지 (이미 작은 구조, layers[0:end-start])
+            pass  # layers[0:end-start]는 이미 작은 구조에 포함됨
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "last":
+            # Last: 모든 레이어 유지 (이미 작은 구조, layers[0:num_layers-start])
+            pass  # layers[0:num_layers-start]는 이미 작은 구조에 포함됨
+            # norm과 lm_head는 유지
+        else:
+            raise ValueError(f"Unknown role: {role}")
     else:
-        raise ValueError(f"Unknown role: {role}")
+        # 전체 다운로드 사용: 기존 pruning 로직 사용
+        if role == "stage0":
+            _prune_layers(full, 0, end)
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "segment":
+            _prune_layers(full, start, end)
+            if hasattr(full, "lm_head"):
+                full.lm_head = None
+            if hasattr(full, "model") and hasattr(full.model, "norm"):
+                full.model.norm = None
+        elif role == "last":
+            _prune_layers(full, start, None)
+            # keep norm/head
+        else:
+            raise ValueError(f"Unknown role: {role}")
 
     # Log resulting layer counts to catch empty segments early
     if hasattr(full, "model") and hasattr(full.model, "layers"):
@@ -658,11 +1585,18 @@ def load_stage_model(
     if quant_type != QuantType.NONE:
         logger.info(f"Quantizing model with {quant_type.name}...")
         # Ensure model is on CPU for quantization
-        if next(full.parameters()).device.type != "cpu":
-            logger.warning("Moving model to CPU for quantization...")
-            full = full.cpu()
+        # Handle meta device tensors from device_map="auto"
+        try:
+            first_param = next(full.parameters())
+            if first_param.device.type == "meta":
+                logger.warning("Model has meta device tensors from device_map='auto', will skip meta tensors during quantization")
+            elif first_param.device.type != "cpu":
+                logger.warning("Moving model to CPU for quantization...")
+                full = full.cpu()
+        except StopIteration:
+            logger.warning("Model has no parameters, skipping quantization")
         
-        # Apply quantization
+        # Apply quantization (will skip meta device tensors)
         full = quantize_module(full, quant_type=quant_type)
         
         # Verify quantization was applied
@@ -708,13 +1642,45 @@ def load_stage_model(
         # Quantized Linear layers will handle device placement during forward pass
         # But we need to move embeddings and other non-quantized components
         try:
-            # Move the entire model structure, bitsandbytes will handle quantized layers
-            full = full.to(device)
+            # Verify no meta tensors before moving
+            has_meta = False
+            try:
+                for param in full.parameters():
+                    if param.device.type == "meta":
+                        has_meta = True
+                        break
+            except:
+                pass
+            
+            if has_meta:
+                logger.error("Model still has meta tensors! Cannot move to device. This should not happen after materialization.")
+                raise RuntimeError("Model has meta tensors that were not materialized")
+            else:
+                # Move the entire model structure, bitsandbytes will handle quantized layers
+                full = full.to(device)
         except Exception as e:
             logger.warning(f"Failed to move quantized model to {device}: {e}. "
                          "Quantized layers may handle device placement automatically during forward pass.")
     else:
-        # Normal model: just move to device
-        full = full.to(device)
+        # Normal model: verify no meta tensors before moving
+        try:
+            has_meta = False
+            try:
+                for param in full.parameters():
+                    if param.device.type == "meta":
+                        has_meta = True
+                        break
+            except:
+                pass
+            
+            if has_meta:
+                logger.error("Model still has meta tensors! Cannot move to device. This should not happen after materialization.")
+                raise RuntimeError("Model has meta tensors that were not materialized")
+            else:
+                full = full.to(device)
+        except StopIteration:
+            logger.warning("Model has no parameters")
+        except Exception as e:
+            logger.warning(f"Failed to move model to {device}: {e}")
     
     return full

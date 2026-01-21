@@ -19,6 +19,7 @@ try:
     from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
+    from .utils import benchmark_server_performance
 except ImportError:
     # 직접 실행될 때 (python src/main.py)
     import sys
@@ -28,6 +29,7 @@ except ImportError:
     from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
+    from src.utils import benchmark_server_performance
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
@@ -300,7 +302,46 @@ def run_stage_server(args, device, splits):
             dtype=args.torch_dtype, 
             quant_type=args.quant_type,
         )
-        stage_model = StageSegment(full, start, end).to(device)
+        stage_model = StageSegment(full, start, end)
+        # Check for meta tensors before moving to device
+        try:
+            has_meta = False
+            for param in stage_model.parameters():
+                if param.device.type == "meta":
+                    has_meta = True
+                    break
+            if has_meta:
+                logger.warning("StageSegment has meta tensors, materializing before moving to device")
+                # Materialize meta tensors from full model
+                from accelerate.utils import set_module_tensor_to_device
+                for name, param in full.named_parameters():
+                    if param.device.type != "meta":
+                        try:
+                            # Try to find corresponding parameter in stage_model
+                            stage_parts = name.split(".")
+                            if stage_parts[0] == "transformer" and len(stage_parts) > 2:
+                                stage_path = ".".join(stage_parts[1:])
+                                try:
+                                    stage_param = dict(stage_model.named_parameters())[stage_path]
+                                    if stage_param.device.type == "meta":
+                                        set_module_tensor_to_device(stage_model, stage_path, "cpu", value=param.cpu())
+                                except (KeyError, AttributeError):
+                                    pass
+                        except Exception as e:
+                            logger.debug(f"Failed to materialize {name}: {e}")
+                stage_model = stage_model.to(device)
+            else:
+                stage_model = stage_model.to(device)
+        except Exception as e:
+            logger.warning(f"Failed to check/move meta tensors: {e}, trying direct to(device)")
+            try:
+                stage_model = stage_model.to(device)
+            except NotImplementedError as nie:
+                if "meta tensor" in str(nie).lower() or "to_empty" in str(nie).lower():
+                    logger.error("Cannot move model with meta tensors. Please ensure all tensors are materialized in load_stage_model.")
+                    raise
+                else:
+                    raise
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
@@ -309,7 +350,46 @@ def run_stage_server(args, device, splits):
             dtype=args.torch_dtype, 
             quant_type=args.quant_type,
         )
-        stage_model = StageSegment(full, start, end).to(device)
+        stage_model = StageSegment(full, start, end)
+        # Check for meta tensors before moving to device
+        try:
+            has_meta = False
+            for param in stage_model.parameters():
+                if param.device.type == "meta":
+                    has_meta = True
+                    break
+            if has_meta:
+                logger.warning("StageSegment has meta tensors, materializing before moving to device")
+                # Materialize meta tensors from full model
+                from accelerate.utils import set_module_tensor_to_device
+                for name, param in full.named_parameters():
+                    if param.device.type != "meta":
+                        try:
+                            # Try to find corresponding parameter in stage_model
+                            stage_parts = name.split(".")
+                            if stage_parts[0] == "transformer" and len(stage_parts) > 2:
+                                stage_path = ".".join(stage_parts[1:])
+                                try:
+                                    stage_param = dict(stage_model.named_parameters())[stage_path]
+                                    if stage_param.device.type == "meta":
+                                        set_module_tensor_to_device(stage_model, stage_path, "cpu", value=param.cpu())
+                                except (KeyError, AttributeError):
+                                    pass
+                        except Exception as e:
+                            logger.debug(f"Failed to materialize {name}: {e}")
+                stage_model = stage_model.to(device)
+            else:
+                stage_model = stage_model.to(device)
+        except Exception as e:
+            logger.warning(f"Failed to check/move meta tensors: {e}, trying direct to(device)")
+            try:
+                stage_model = stage_model.to(device)
+            except NotImplementedError as nie:
+                if "meta tensor" in str(nie).lower() or "to_empty" in str(nie).lower():
+                    logger.error("Cannot move model with meta tensors. Please ensure all tensors are materialized in load_stage_model.")
+                    raise
+                else:
+                    raise
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
@@ -318,10 +398,73 @@ def run_stage_server(args, device, splits):
             dtype=args.torch_dtype, 
             quant_type=args.quant_type,
         )
-        stage_model = StageLast(full, start).to(device)
+        stage_model = StageLast(full, start)
+        # Check for meta tensors before moving to device
+        try:
+            has_meta = False
+            for param in stage_model.parameters():
+                if param.device.type == "meta":
+                    has_meta = True
+                    break
+            if has_meta:
+                logger.warning("StageLast has meta tensors, using to_empty() instead of to()")
+                # Use to_empty() to create structure on device, then materialize
+                stage_model = stage_model.to_empty(device=device)
+                # Materialize remaining meta tensors from full model
+                from accelerate.utils import set_module_tensor_to_device
+                for name, param in full.named_parameters():
+                    if param.device.type != "meta":
+                        try:
+                            parts = name.split(".")
+                            if len(parts) > 1:
+                                module_path = ".".join(parts[:-1])
+                                param_name = parts[-1]
+                                # Try to find corresponding parameter in stage_model
+                                stage_parts = name.split(".")
+                                if stage_parts[0] == "transformer" and len(stage_parts) > 2:
+                                    # Adjust path for stage model
+                                    stage_path = ".".join(stage_parts[1:])
+                                    try:
+                                        stage_param = dict(stage_model.named_parameters())[stage_path]
+                                        if stage_param.device.type == "meta":
+                                            set_module_tensor_to_device(stage_model, stage_path, device, value=param.to(device))
+                                    except (KeyError, AttributeError):
+                                        pass
+                        except Exception as e:
+                            logger.debug(f"Failed to materialize {name}: {e}")
+            else:
+                stage_model = stage_model.to(device)
+        except Exception as e:
+            logger.warning(f"Failed to check/move meta tensors: {e}, trying direct to(device)")
+            try:
+                stage_model = stage_model.to(device)
+            except NotImplementedError as nie:
+                if "meta tensor" in str(nie).lower() or "to_empty" in str(nie).lower():
+                    logger.error("Cannot move model with meta tensors. Please ensure all tensors are materialized in load_stage_model.")
+                    raise
+                else:
+                    raise
         final_stage = True
     else:
         raise ValueError("stage must be 1, 2, or 3 for server")
+
+    # 벤치마크 실행: 모델 로드 후, DHT 등록 전
+    logger.info("Running server performance benchmark...")
+    num_layers = len(stage_model.layers) if hasattr(stage_model, 'layers') else 0
+    benchmark_results = benchmark_server_performance(
+        stage_model=stage_model,
+        device=device,
+        config=full.config,
+        num_layers=num_layers,
+        quant_type=args.quant_type,
+    )
+    server_throughput = benchmark_results["throughput"]
+    logger.info(
+        f"Server benchmark complete: "
+        f"network={benchmark_results['network_rps']:.1f} tokens/s, "
+        f"gpu={benchmark_results['gpu_rps']:.1f} tokens/s, "
+        f"final throughput={server_throughput:.1f} tokens/s"
+    )
 
     dht_peers = args.dht_initial_peers.split(",") if args.dht_initial_peers else []
     initial_peers_list = _format_initial_peers(args.dht_initial_peers)
@@ -434,6 +577,8 @@ def run_stage_server(args, device, splits):
                 "peer_id": str(p2p.peer_id),          # 서버 고유 ID (subkey로도 사용)
                 "timestamp": get_dht_time(),
                 "stage": args.stage,
+                "throughput": server_throughput,  # tokens/s (min of network and GPU)
+                "benchmark_time": get_dht_time(),  # 벤치마크 실행 시점
             }
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs
