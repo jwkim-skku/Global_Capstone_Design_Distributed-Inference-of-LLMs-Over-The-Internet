@@ -10,7 +10,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-# 분산 추론용 import 제거 - 단일 GPU에서는 불필요
+# 양자화 관련 import
+from src.llama_partition import QuantType, quantize_module
 
 
 def main():
@@ -19,8 +20,8 @@ def main():
                        help="Model name or path")
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"],
-                       help="Model dtype: fp16 (default), bf16, fp32")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32", "int4", "int8"],
+                       help="Model dtype: fp16 (default), bf16, fp32, int4 (NF4), int8")
     parser.add_argument("--max_new_tokens", type=int, default=64,
                        help="Maximum number of new tokens to generate")
     parser.add_argument("--temperature", type=float, default=1.0,
@@ -29,6 +30,8 @@ def main():
                        help="Nucleus sampling p")
     parser.add_argument("--top_k", type=int, default=50,
                        help="Top-k sampling")
+    parser.add_argument("--disable_eos", action="store_true",
+                       help="Disable EOS token generation (mask EOS token in sampling)")
     parser.add_argument("--use_cpu_offload", action="store_true",
                        help="Enable CPU offloading: keep model parameters on CPU and move to GPU only when needed")
     parser.add_argument("--keep_layers_on_gpu", type=int, default=0,
@@ -36,13 +39,23 @@ def main():
     
     args = parser.parse_args()
     
-    # dtype 변환
+    # dtype 변환 및 양자화 타입 결정
     dtype_map = {
         "fp16": torch.float16,
         "bf16": torch.bfloat16,
         "fp32": torch.float32,
     }
-    dtype = dtype_map[args.dtype]
+    
+    # 양자화 타입 결정
+    if args.dtype == "int4":
+        quant_type = QuantType.NF4
+        dtype = torch.float16  # 양자화 시 base dtype은 fp16 사용
+    elif args.dtype == "int8":
+        quant_type = QuantType.INT8
+        dtype = torch.float16  # 양자화 시 base dtype은 fp16 사용
+    else:
+        quant_type = QuantType.NONE
+        dtype = dtype_map[args.dtype]
     
     model_name = args.model
     prompt = args.prompt
@@ -50,6 +63,7 @@ def main():
     temperature = args.temperature
     top_p = args.top_p
     top_k = args.top_k
+    disable_eos = args.disable_eos
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -57,24 +71,158 @@ def main():
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
     
-    # 모델 로드 (CPU 오프로딩 지원)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        low_cpu_mem_usage=True,
-    )
+    # 모델 로드 (양자화를 위해 항상 CPU에 먼저 로드)
+    print(f"Loading model: {model_name}")
+    print(f"Quantization: {quant_type.name if quant_type != QuantType.NONE else 'None'}")
+    
+    # 양자화가 필요한 경우 CPU에 로드 (양자화는 CPU에서 수행)
+    if quant_type != QuantType.NONE:
+        print("Loading model on CPU for quantization...")
+        # 대용량 모델 로딩을 위한 메모리 제한 및 디스크 오프로딩 설정
+        import psutil
+        import tempfile
+        import os
+        
+        available_memory = psutil.virtual_memory().available
+        # BLOOM-176B INT4는 약 93.5GB 필요, 피크 메모리 ~200GB
+        # 사용 가능한 메모리의 75%를 사용하되, 최소 250GB는 보장 (충분한 메모리가 있을 때)
+        min_required_mb = 250 * 1024  # 최소 250GB (충분한 메모리가 있을 때)
+        calculated_mb = int(available_memory * 0.75 / (1024 * 1024))
+        max_memory_mb = max(min_required_mb, calculated_mb)
+        
+        # 사용 가능한 메모리가 300GB 이상이면 제한을 더 완화
+        if available_memory / (1024**3) >= 300:
+            calculated_mb = int(available_memory * 0.8 / (1024 * 1024))
+            max_memory_mb = calculated_mb
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, using 80% = {max_memory_mb / 1024:.1f}GB (large memory mode)")
+        else:
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, using 75% = {max_memory_mb / 1024:.1f}GB")
+        
+        max_memory = {"cpu": f"{max_memory_mb}MiB"}
+        
+        # 디스크 오프로딩을 위한 임시 디렉토리 생성
+        offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+        print(f"Using disk offloading folder: {offload_folder}")
+        
+        try:
+            # 메모리 사용량을 최소화하기 위한 추가 옵션
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                device_map="cpu",  # 양자화를 위해 CPU에 로드
+                max_memory=max_memory,  # 메모리 사용량 제한
+                offload_folder=offload_folder,  # 디스크 오프로딩
+                # 추가 메모리 최적화 옵션
+                use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+            )
+        except Exception as e:
+            # 오프로딩 폴더 정리
+            import shutil
+            try:
+                shutil.rmtree(offload_folder)
+            except:
+                pass
+            raise e
+        
+        # 양자화 적용
+        # 4bit 양자화의 경우 compute_dtype을 float16으로 설정하여 입력 dtype과 일치시킴
+        compute_dtype = torch.float16 if quant_type == QuantType.NF4 else None
+        if compute_dtype is not None:
+            print(f"Setting compute_dtype to {compute_dtype} for 4bit quantization")
+        print(f"Applying {quant_type.name} quantization...")
+        model = quantize_module(model, quant_type=quant_type, compute_dtype=compute_dtype)
+        
+        # 양자화 검증
+        try:
+            import bitsandbytes as bnb
+            quantized_modules = []
+            linear_modules = []
+            for name, m in model.named_modules():
+                if isinstance(m, torch.nn.Linear):
+                    linear_modules.append(name)
+                if isinstance(m, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+                    quantized_modules.append(name)
+            
+            total_quantized = len(quantized_modules)
+            total_linear = len(linear_modules)
+            quant_ratio = (total_quantized / total_linear * 100) if total_linear > 0 else 0
+            
+            print(f"Quantization verification: {total_quantized} quantized Linear layers "
+                  f"out of {total_linear} total Linear layers ({quant_ratio:.1f}%)")
+        except ImportError:
+            pass
+        
+        print(f"Quantization with {quant_type.name} completed")
+        
+        # 양자화 완료 후 오프로딩 폴더 정리 (메모리 절약)
+        import shutil
+        try:
+            if 'offload_folder' in locals() and os.path.exists(offload_folder):
+                print(f"Cleaning up offload folder: {offload_folder}")
+                shutil.rmtree(offload_folder)
+        except Exception as e:
+            print(f"Warning: Failed to clean up offload folder: {e}")
+    else:
+        # 양자화 없이 일반 로드
+        # CPU offload를 사용할 경우 메모리 제한 및 디스크 오프로딩 사용
+        if args.use_cpu_offload:
+            import psutil
+            import tempfile
+            
+            available_memory = psutil.virtual_memory().available
+            # 다른 프로세스와 공유하므로 매우 보수적으로 25%만 사용
+            max_memory_mb = int(available_memory * 0.25 / (1024 * 1024))
+            max_memory = {"cpu": f"{max_memory_mb}MiB"}
+            print(f"Available memory: {available_memory / (1024**3):.1f}GB, limiting to {max_memory_mb / 1024:.1f}GB (25% for safety)")
+            
+            # 디스크 오프로딩을 위한 임시 디렉토리 생성
+            offload_folder = tempfile.mkdtemp(prefix="model_offload_")
+            print(f"Using disk offloading folder: {offload_folder}")
+            
+            try:
+                # 메모리 사용량을 최소화하기 위한 추가 옵션
+                model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=dtype,
+                    low_cpu_mem_usage=True,
+                    device_map="cpu",  # CPU에 직접 로드
+                    max_memory=max_memory,  # 메모리 사용량 제한
+                    offload_folder=offload_folder,  # 디스크 오프로딩
+                    # 추가 메모리 최적화 옵션
+                    use_safetensors=True,  # safetensors 사용 (더 안전하고 메모리 효율적)
+                )
+            except Exception as e:
+                # 오프로딩 폴더 정리
+                import shutil
+                try:
+                    shutil.rmtree(offload_folder)
+                except:
+                    pass
+                raise e
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+            )
     
     if args.use_cpu_offload:
         # CPU 오프로딩 모드: 모델을 CPU에 로드하고 forward 시 필요한 레이어만 GPU로 이동
-        model = model.to(torch.device("cpu"))
+        # 양자화된 모델은 이미 CPU에 있으므로 이동 불필요
+        if quant_type == QuantType.NONE:
+            model = model.to(torch.device("cpu"))
         
-        # 레이어 접근 (LLaMA 구조)
+        # 레이어 접근 (다양한 모델 구조 지원)
+        layers = None
         if hasattr(model, "model") and hasattr(model.model, "layers"):
+            # LLaMA/Mistral 구조
             layers = model.model.layers
         elif hasattr(model, "transformer") and hasattr(model.transformer, "h"):
+            # GPT/BLOOM 구조
             layers = model.transformer.h
         else:
-            raise ValueError("Unsupported model architecture: cannot find layers")
+            raise ValueError(f"Unsupported model architecture: cannot find layers. Model type: {type(model)}, has model.model: {hasattr(model, 'model')}, has transformer: {hasattr(model, 'transformer')}")
         
         # 레이어별 device 추적
         layer_devices = {}
@@ -140,28 +288,104 @@ def main():
             layer.forward = types.MethodType(wrapped_fn, layer)
         
         # Embeddings와 norm, lm_head는 항상 GPU에 유지 (작고 자주 사용)
+        # LLaMA 구조
         if hasattr(model, "model") and hasattr(model.model, "embed_tokens"):
             model.model.embed_tokens = model.model.embed_tokens.to(device)
+        # GPT 구조
         elif hasattr(model, "transformer") and hasattr(model.transformer, "wte"):
             model.transformer.wte = model.transformer.wte.to(device)
+        # BLOOM 구조
+        elif hasattr(model, "transformer") and hasattr(model.transformer, "word_embeddings"):
+            model.transformer.word_embeddings = model.transformer.word_embeddings.to(device)
+            # BLOOM의 word_embeddings_layernorm도 GPU로 이동
+            if hasattr(model.transformer, "word_embeddings_layernorm"):
+                model.transformer.word_embeddings_layernorm = model.transformer.word_embeddings_layernorm.to(device)
 
+        # Rotary embeddings (LLaMA/Mistral)
         if hasattr(model, "model") and hasattr(model.model, "rotary_emb"):
             model.model.rotary_emb = model.model.rotary_emb.to(device)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "rotary_emb"):
             model.transformer.rotary_emb = model.transformer.rotary_emb.to(device)
         
+        # Final layer norm
         if hasattr(model, "model") and hasattr(model.model, "norm"):
             model.model.norm = model.model.norm.to(device)
         elif hasattr(model, "transformer") and hasattr(model.transformer, "ln_f"):
             model.transformer.ln_f = model.transformer.ln_f.to(device)
         
+        # Language model head
         if hasattr(model, "lm_head"):
             model.lm_head = model.lm_head.to(device)
+        
+        # 모델의 forward pass를 래핑하여 입력 처리 전에 필요한 모듈들을 GPU로 이동
+        original_forward = model.__class__.forward
+        
+        def wrapped_model_forward(self, *args, **kwargs):
+            # 입력 텐서를 GPU로 이동 (이미 GPU에 있으면 no-op)
+            if args and len(args) > 0 and isinstance(args[0], torch.Tensor):
+                args = (args[0].to(device),) + args[1:]
+            if "input_ids" in kwargs and isinstance(kwargs["input_ids"], torch.Tensor):
+                kwargs["input_ids"] = kwargs["input_ids"].to(device)
+            if "inputs_embeds" in kwargs and isinstance(kwargs["inputs_embeds"], torch.Tensor):
+                kwargs["inputs_embeds"] = kwargs["inputs_embeds"].to(device)
+            if "attention_mask" in kwargs and isinstance(kwargs["attention_mask"], torch.Tensor):
+                kwargs["attention_mask"] = kwargs["attention_mask"].to(device)
+            if "position_ids" in kwargs and isinstance(kwargs["position_ids"], torch.Tensor):
+                kwargs["position_ids"] = kwargs["position_ids"].to(device)
+            
+            # Embeddings와 norm이 GPU에 있는지 확인하고 없으면 이동
+            def check_and_move(module, target_device):
+                """모듈이 target_device에 없으면 이동"""
+                try:
+                    param = next(module.parameters(), None)
+                    if param is not None and param.device != target_device:
+                        module.to(target_device)
+                except StopIteration:
+                    # 파라미터가 없는 경우에도 디바이스 확인
+                    try:
+                        buffer = next(module.buffers(), None)
+                        if buffer is not None and buffer.device != target_device:
+                            module.to(target_device)
+                    except StopIteration:
+                        # 파라미터와 버퍼가 모두 없는 경우에도 이동 시도
+                        module.to(target_device)
+            
+            # LLaMA 구조
+            if hasattr(self, "model") and hasattr(self.model, "embed_tokens"):
+                check_and_move(self.model.embed_tokens, device)
+            # GPT 구조
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "wte"):
+                check_and_move(self.transformer.wte, device)
+            # BLOOM 구조
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "word_embeddings"):
+                check_and_move(self.transformer.word_embeddings, device)
+                if hasattr(self.transformer, "word_embeddings_layernorm"):
+                    check_and_move(self.transformer.word_embeddings_layernorm, device)
+            
+            # Final norm
+            if hasattr(self, "model") and hasattr(self.model, "norm"):
+                check_and_move(self.model.norm, device)
+            elif hasattr(self, "transformer") and hasattr(self.transformer, "ln_f"):
+                check_and_move(self.transformer.ln_f, device)
+            
+            # LM head
+            if hasattr(self, "lm_head"):
+                check_and_move(self.lm_head, device)
+            
+            return original_forward(self, *args, **kwargs)
+        
+        model.forward = types.MethodType(wrapped_model_forward, model)
         
         print(f"CPU offloading enabled: Model loaded with lazy GPU loading (keep {args.keep_layers_on_gpu} layers on GPU)")
     else:
         # 일반 모드: 전체 모델을 GPU에 로드
-        model = model.to(device)
+        # 양자화된 모델은 bitsandbytes가 자동으로 device placement 처리
+        if quant_type == QuantType.NONE:
+            model = model.to(device)
+        else:
+            # 양자화된 모델은 GPU로 이동 (bitsandbytes가 자동 처리)
+            print("Moving quantized model to GPU (bitsandbytes will handle device placement)...")
+            model = model.to(device)
     
     model.eval()
     
@@ -222,6 +446,12 @@ def main():
             logits = outputs.logits  # [1, 1, vocab]
             past_key_values = outputs.past_key_values
             next_token_logits = logits[:, -1, :]  # [1, vocab]
+        
+        # EOS 토큰 마스킹 (disable_eos 옵션이 켜져있으면)
+        # inference_mode 밖에서 수정해야 하므로 clone 사용
+        if disable_eos and eos_token_id is not None:
+            next_token_logits = next_token_logits.clone()
+            next_token_logits[0, eos_token_id] = float('-inf')
         
         # 샘플링 (temperature, top_p, top_k 적용)
         if temperature > 0:
