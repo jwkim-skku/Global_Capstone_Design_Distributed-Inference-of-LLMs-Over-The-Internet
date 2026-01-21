@@ -5,10 +5,8 @@ from uuid import uuid4
 import time
 
 import torch
-import torch.nn as nn
 from transformers import AutoTokenizer
 import logging
-from enum import Enum
 from hivemind import DHT, get_dht_time
 from hivemind.p2p import P2P
 from hivemind.utils.logging import get_logger
@@ -16,7 +14,7 @@ from hivemind.utils.logging import get_logger
 # Import 경로 처리: 패키지로 실행되거나 직접 실행될 때 모두 지원
 try:
     # 패키지로 실행될 때 (python -m src.main)
-    from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
+    from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
 except ImportError:
@@ -25,13 +23,14 @@ except ImportError:
     from pathlib import Path
     project_root = Path(__file__).parent.parent
     sys.path.insert(0, str(project_root))
-    from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast, QuantType
+    from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
 
 logger = get_logger(__name__)
 # Ensure logs are emitted when running from terminal
 logging.basicConfig(level=logging.INFO)
+
 
 def build_masks(seq_len: int, device, dtype=None):
     # batch=1, no padding
@@ -95,11 +94,7 @@ def run_rank0(args, device, splits):
         return str(type(past))
 
     # 1. Initialize
-    full = load_stage_model(
-        args.model, device, role="stage0", end=splits[0], 
-        dtype=args.torch_dtype, 
-        quant_type=args.quant_type,
-    )
+    full = load_stage_model(args.model, device, role="stage0", end=splits[0], dtype=args.dtype)
     s0 = Stage0(full, splits[0]).to(device) # load to GPU
 
     # connect to DHT Network with initial(stage1) DHT peer address
@@ -296,29 +291,26 @@ def run_stage_server(args, device, splits):
     if args.stage == 1:
         start, end = splits[0], splits[1]
         full = load_stage_model(
-            args.model, device, role="segment", start=start, end=end, 
-            dtype=args.torch_dtype, 
-            quant_type=args.quant_type,
+            args.model, device, role="segment", 
+            start=start, end=end, dtype=args.dtype
         )
-        stage_model = StageSegment(full, start, end).to(device)
+        stage_model = StageSegment(full, start, end)
         final_stage = False
     elif args.stage == 2:
         start, end = splits[1], splits[2]
         full = load_stage_model(
-            args.model, device, role="segment", start=start, end=end, 
-            dtype=args.torch_dtype, 
-            quant_type=args.quant_type,
+            args.model, device, role="segment",
+            start=start, end=end, dtype=args.dtype
         )
-        stage_model = StageSegment(full, start, end).to(device)
+        stage_model = StageSegment(full, start, end)
         final_stage = False
     elif args.stage == 3:
         start = splits[2]
         full = load_stage_model(
-            args.model, device, role="last", start=start, 
-            dtype=args.torch_dtype, 
-            quant_type=args.quant_type,
+            args.model, device, role="last",
+            start=start, dtype=args.dtype
         )
-        stage_model = StageLast(full, start).to(device)
+        stage_model = StageLast(full, start)
         final_stage = True
     else:
         raise ValueError("stage must be 1, 2, or 3 for server")
@@ -431,44 +423,18 @@ def run_stage_server(args, device, splits):
                 logger.warning(f"Stage{args.stage} P2P listen maddrs unknown; using fallback {p2p_maddrs}")
 
             peer_info = {
-                "peer_id": str(p2p.peer_id),          # 서버 고유 ID (subkey로도 사용)
+                "peer_id": str(p2p.peer_id),
+                "ip": local_ip,
+                "rpc_port": args.rpc_port,
+                "dht_port": args.dht_port,
                 "timestamp": get_dht_time(),
-                "stage": args.stage,
             }
+            # P2P Multiaddr 존재하면 peer_info에 추가
             if p2p_maddrs:
                 peer_info["p2p_maddrs"] = p2p_maddrs
 
-            # ✅ (핵심) 같은 stage_key 아래에 여러 서버가 공존하도록 subkey 사용
-            STAGE_KEY = f"mini_petals:stage{args.stage}"
-            SUBKEY = str(p2p.peer_id)
-
-            # ✅ (핵심) 죽은 서버가 오래 남지 않게 TTL 짧게 + heartbeat 갱신
-            TTL = 45  # seconds (권장: 30~60)
-
-            def _store_once():
-                peer_info["timestamp"] = get_dht_time()
-                dht.store(
-                    key=STAGE_KEY,
-                    subkey=SUBKEY,
-                    value=peer_info,
-                    expiration_time=get_dht_time() + TTL,
-                )
-
-            # 최초 1회 등록
-            _store_once()
-            logger.info(f"Stage{args.stage} registered in DHT: key={STAGE_KEY}, subkey={SUBKEY[:8]}..., ttl={TTL}s")
-
-            # 주기적 heartbeat (TTL/3 마다 갱신)
-            async def heartbeat():
-                while True:
-                    try:
-                        _store_once()
-                    except Exception as e:
-                        logger.warning(f"Stage{args.stage} heartbeat failed: {e}")
-                    await asyncio.sleep(TTL / 3)
-
-            hb_task = asyncio.create_task(heartbeat())
-
+            # DHT Network에 rpc 통신에 필요한 정보 저장
+            dht.store(f"mini_petals:stage{args.stage}", peer_info, expiration_time=get_dht_time() + 3600)
 
             # P2P Daemon에 StageConnectionHandler의 rpc_* 메서드 등록
             await handler.add_p2p_handlers(p2p)
@@ -482,8 +448,6 @@ def run_stage_server(args, device, splits):
         except KeyboardInterrupt:
             logger.info(f"Stage{args.stage} shutting down...")
         finally:
-            if 'hb_task' in locals():
-                hb_task.cancel()
             if p2p:
                 try:
                     await p2p.shutdown()
@@ -498,8 +462,8 @@ def main():
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--splits", type=str, required=True,
                        help="Comma-separated cut points for 4-stage pipeline, e.g., 10,20,30")
-    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32", "int4", "int8"],
-                       help="Model dtype: fp16 (default), bf16, fp32, int4, int8")
+    parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"],
+                       help="Model dtype: fp16 (default), bf16, fp32")
     parser.add_argument("--max_new_tokens", type=int, default=64)
     parser.add_argument("--prompt", type=str, default="Hello, how are you?",
                        help="Input prompt for text generation")
@@ -532,36 +496,12 @@ def main():
         device = torch.device("cpu")
     logger.info(f"Using device: {device}")
 
-    # Handle dtype and quantization
-    if args.dtype in ["int4", "int8"]:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "bitsandbytes is required for int4/int8 quantization. "
-                "Install it with: pip install bitsandbytes"
-            )
-        
-        # Convert dtype string to QuantType
-        if args.dtype == "int4":
-            args.quant_type = QuantType.NF4
-            logger.info(f"Using NF4 quantization (4-bit)")
-        else:  # int8
-            args.quant_type = QuantType.INT8
-            logger.info(f"Using INT8 quantization (8-bit)")
-        
-        # For quantization, we still need a compute dtype for non-quantized parts
-        # Default to fp16 for compatibility
-        args.torch_dtype = torch.float16
-    else:
-        dtype_map = {
-            "fp16": torch.float16,
-            "bf16": torch.bfloat16,
-            "fp32": torch.float32,
-        }
-        args.torch_dtype = dtype_map[args.dtype]
-        args.quant_type = QuantType.NONE
-        logger.info(f"Using torch_dtype={args.torch_dtype}, no quantization")
+    dtype_map = {
+        "fp16": torch.float16,
+        "bf16": torch.bfloat16,
+        "fp32": torch.float32,
+    }
+    args.dtype = dtype_map[args.dtype]
     
     splits = parse_splits(args.splits)
     if args.stage == 0:

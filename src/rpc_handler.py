@@ -40,21 +40,6 @@ from hivemind.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-def _has_quantized_layers(model) -> bool:
-    """
-    Check if model contains quantized Linear layers (bitsandbytes).
-    """
-    try:
-        import bitsandbytes as bnb
-    except ImportError:
-        return False
-    
-    for module in model.modules():
-        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
-            return True
-    return False
-
-
 class StageConnectionHandler(ConnectionHandler):
     """Connection handler for Stage1 that processes forward requests."""
 
@@ -191,53 +176,31 @@ class StageConnectionHandler(ConnectionHandler):
         if is_prefill:
             past_key_values = None
             past_len = 0
-            # Replay 모드에서 prefill이면 기존 KV cache 초기화
-            if is_replay and session_id in self._kv_cache:
-                logger.info(f"[{session_id[:8]}] REPLAY: Clearing existing KV cache for prefill")
-                self._kv_cache[session_id] = None
             # logger.info(f"[{session_id[:8]}] PREFILL: seq_len={seq_len}, cur_len={cur_len}, past_len=0 (no cache)")
         else:
             past_key_values = self._kv_cache.get(session_id)
             if past_key_values is None:
-                # Replay 모드에서 KV cache가 없으면 prefill로 처리 (새 서버에 첫 요청)
-                if is_replay:
-                    logger.warning(
-                        f"[{session_id[:8]}] REPLAY: Missing KV cache for decode step, "
-                        f"treating as prefill (seq_len={seq_len}, cur_len={cur_len}). "
-                        f"This may indicate the first replay request to a new server."
-                    )
-                    past_key_values = None
-                    past_len = 0
-                    # is_prefill은 변경하지 않고, past_key_values만 None으로 처리
-                else:
-                    raise ValueError(
-                        f"Missing past_key_values for session_id={session_id}. "
-                        f"This may indicate a server restart or cache loss. "
-                        f"If this is a replay scenario, ensure is_replay=True in metadata."
-                    )
-            else:
-                past_len = StageConnectionHandler._past_len(past_key_values, cur_len, hidden_states.shape[1])
-            
-            # 디버깅: past_len이 올바른지 확인 (replay 모드가 아닐 때만 검증)
-            if not is_replay and past_key_values is not None:
-                expected_past_len = cur_len - hidden_states.shape[1]
-                if past_len != expected_past_len:
-                    pkv_type = type(past_key_values).__name__
+                raise ValueError(f"Missing past_key_values for session_id={session_id}")
+            past_len = StageConnectionHandler._past_len(past_key_values, cur_len, hidden_states.shape[1])
+            # 디버깅: past_len이 올바른지 확인 (INFO 레벨로 변경하여 항상 출력)
+            expected_past_len = cur_len - hidden_states.shape[1]
+            if past_len != expected_past_len:
+                pkv_type = type(past_key_values).__name__
+                try:
+                    from transformers.cache_utils import Cache  # type: ignore
+                except Exception:
+                    Cache = None
+                cache_len = None
+                if Cache is not None and isinstance(past_key_values, Cache):
                     try:
-                        from transformers.cache_utils import Cache  # type: ignore
+                        cache_len = past_key_values.get_seq_length()
                     except Exception:
-                        Cache = None
-                    cache_len = None
-                    if Cache is not None and isinstance(past_key_values, Cache):
-                        try:
-                            cache_len = past_key_values.get_seq_length()
-                        except Exception:
-                            cache_len = "error"
-                    logger.warning(
-                        f"[{session_id[:8]}] DECODE: Past len mismatch! past_len={past_len}, cur_len={cur_len}, "
-                        f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}, "
-                        f"pkv_type={pkv_type}, cache_len={cache_len}"
-                    )
+                        cache_len = "error"
+                logger.warning(
+                    f"[{session_id[:8]}] DECODE: Past len mismatch! past_len={past_len}, cur_len={cur_len}, "
+                    f"hidden_shape={hidden_states.shape[1]}, expected={expected_past_len}, "
+                    f"pkv_type={pkv_type}, cache_len={cache_len}"
+                )
             # else:
             #     logger.info(
             #         f"[{session_id[:8]}] DECODE: seq_len={seq_len}, cur_len={cur_len}, past_len={past_len}, "
@@ -251,18 +214,8 @@ class StageConnectionHandler(ConnectionHandler):
 
         with torch.inference_mode():
             cfg_dtype = getattr(getattr(self.stage_model, "config", None), "torch_dtype", None)
-            
-            # For quantized models, KV cache and activations should use fp16
-            # even though weights are quantized
-            if _has_quantized_layers(self.stage_model):
-                # Quantized models: use fp16 for activations and KV cache
-                model_dtype = torch.float16
-                logger.debug(f"[{session_id[:8]}] {stage_name}: Detected quantized model, using fp16 for KV cache")
-            else:
-                # Non-quantized models: use config dtype or infer from parameters
-                first_param = next(self.stage_model.parameters(), None)
-                model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else hidden_states.dtype)
-            
+            first_param = next(self.stage_model.parameters(), None)
+            model_dtype = cfg_dtype or (first_param.dtype if first_param is not None else hidden_states.dtype)
             inputs = hidden_states.to(self.device, dtype=model_dtype)
             # logger.info(f"[{session_id[:8]}] {stage_name}: Converted inputs dtype={inputs.dtype} (model_dtype={model_dtype})")
             
@@ -279,28 +232,6 @@ class StageConnectionHandler(ConnectionHandler):
                     past_key_values=past_key_values,
                     use_cache=True,
                 )
-                
-                # Validate KV cache for quantized models
-                if _has_quantized_layers(self.stage_model) and new_past is not None:
-                    if isinstance(new_past, (tuple, list)) and len(new_past) > 0:
-                        first_cache = new_past[0]
-                        if isinstance(first_cache, (tuple, list)) and len(first_cache) == 2:
-                            key, value = first_cache
-                            if key is not None and value is not None:
-                                logger.debug(
-                                    f"[{session_id[:8]}] {stage_name}: KV cache returned - "
-                                    f"key dtype={key.dtype}, value dtype={value.dtype}, "
-                                    f"key shape={key.shape}, value shape={value.shape}"
-                                )
-                            else:
-                                logger.warning(
-                                    f"[{session_id[:8]}] {stage_name}: KV cache contains None values"
-                                )
-                    else:
-                        logger.warning(
-                            f"[{session_id[:8]}] {stage_name}: Unexpected KV cache format: {type(new_past)}"
-                        )
-                        
             except StopIteration as e:
                 logger.error(
                     f"[{session_id[:8]}] StopIteration from stage_model: "
@@ -310,11 +241,6 @@ class StageConnectionHandler(ConnectionHandler):
                 raise RuntimeError("stage_model raised StopIteration") from e
 
         # KV 캐시 업데이트 (replay 모드에서도 복구를 위해 필요)
-        if new_past is None:
-            logger.warning(
-                f"[{session_id[:8]}] {stage_name}: No KV cache returned from model "
-                f"(use_cache=True but new_past is None)"
-            )
         self._kv_cache[session_id] = new_past
 
         if self.final_stage:
