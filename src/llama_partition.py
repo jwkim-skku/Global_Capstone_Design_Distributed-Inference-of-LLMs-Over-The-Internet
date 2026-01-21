@@ -4,8 +4,24 @@ from enum import Enum
 
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
+from transformers.models.llama.configuration_llama import LlamaConfig
+
+# Qwen 모델 지원을 위한 import (선택적)
+try:
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+    from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+    QWEN_AVAILABLE = True
+except ImportError:
+    try:
+        from transformers.models.qwen.modeling_qwen import QwenDecoderLayer as Qwen2DecoderLayer
+        from transformers.models.qwen.configuration_qwen import QwenConfig as Qwen2Config
+        QWEN_AVAILABLE = True
+    except ImportError:
+        Qwen2DecoderLayer = None
+        Qwen2Config = None
+        QWEN_AVAILABLE = False
 
 from .utils import default_position_ids
 
@@ -123,12 +139,18 @@ def _has_quantized_layers(layer: nn.Module) -> bool:
     """
     try:
         import bitsandbytes as bnb
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # ImportError: bitsandbytes not installed
+        # RuntimeError: bitsandbytes CUDA setup failed
         return False
     
-    for module in layer.modules():
-        if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
-            return True
+    try:
+        for module in layer.modules():
+            if isinstance(module, (bnb.nn.LinearNF4, bnb.nn.Linear8bitLt)):
+                return True
+    except (AttributeError, RuntimeError):
+        # bitsandbytes가 설치되어 있지만 제대로 작동하지 않는 경우
+        return False
     return False
 
 
@@ -136,19 +158,95 @@ def _count_quantized_modules(layer: nn.Module) -> dict:
     """Count quantized modules in a layer."""
     try:
         import bitsandbytes as bnb
-    except ImportError:
+    except (ImportError, RuntimeError):
+        # ImportError: bitsandbytes not installed
+        # RuntimeError: bitsandbytes CUDA setup failed
         return {"int8": 0, "nf4": 0, "total": 0}
     
-    int8_count = 0
-    nf4_count = 0
+    try:
+        int8_count = 0
+        nf4_count = 0
+        
+        for module in layer.modules():
+            if isinstance(module, bnb.nn.Linear8bitLt):
+                int8_count += 1
+            elif isinstance(module, bnb.nn.LinearNF4):
+                nf4_count += 1
+        
+        return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
+    except (AttributeError, RuntimeError):
+        # bitsandbytes가 설치되어 있지만 제대로 작동하지 않는 경우
+        return {"int8": 0, "nf4": 0, "total": 0}
+
+
+def _convert_config_to_llama_config(config):
+    """
+    Convert Qwen2Config (or other LLaMA-compatible configs) to LlamaConfig
+    for use with OptimizedLlamaDecoderLayer.
     
-    for module in layer.modules():
-        if isinstance(module, bnb.nn.Linear8bitLt):
-            int8_count += 1
-        elif isinstance(module, bnb.nn.LinearNF4):
-            nf4_count += 1
+    This creates a LlamaConfig with the same parameters as the original config,
+    ensuring compatibility with OptimizedLlamaDecoderLayer.
+    """
+    # If already LlamaConfig, return as-is
+    if isinstance(config, LlamaConfig):
+        return config
     
-    return {"int8": int8_count, "nf4": nf4_count, "total": int8_count + nf4_count}
+    # Check if it's a Qwen config
+    is_qwen_config = QWEN_AVAILABLE and isinstance(config, Qwen2Config)
+    
+    if is_qwen_config or getattr(config, "model_type", "").lower() in ["qwen", "qwen2"]:
+        # Create LlamaConfig from Qwen2Config parameters
+        llama_config = LlamaConfig(
+            vocab_size=getattr(config, 'vocab_size', 151936),
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
+            hidden_act=config.hidden_act,
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 32768),
+            initializer_range=getattr(config, 'initializer_range', 0.02),
+            rms_norm_eps=config.rms_norm_eps,
+            use_cache=getattr(config, 'use_cache', True),
+            pad_token_id=getattr(config, 'pad_token_id', None),
+            bos_token_id=getattr(config, 'bos_token_id', None),
+            eos_token_id=getattr(config, 'eos_token_id', None),
+            tie_word_embeddings=getattr(config, 'tie_word_embeddings', False),
+            rope_theta=getattr(config, 'rope_theta', 10000.0),
+            attention_bias=False,  # Qwen doesn't use attention bias
+            pretraining_tp=1,     # Default: no tensor parallelism
+        )
+        logger.debug(f"Converted Qwen2Config to LlamaConfig for OptimizedLlamaDecoderLayer compatibility")
+        return llama_config
+    
+    # For other configs, try to create LlamaConfig with available attributes
+    # This is a fallback for other LLaMA-compatible models
+    try:
+        llama_config = LlamaConfig(
+            vocab_size=getattr(config, 'vocab_size', 32000),
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            num_hidden_layers=config.num_hidden_layers,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=getattr(config, 'num_key_value_heads', config.num_attention_heads),
+            hidden_act=getattr(config, 'hidden_act', 'silu'),
+            max_position_embeddings=getattr(config, 'max_position_embeddings', 2048),
+            initializer_range=getattr(config, 'initializer_range', 0.02),
+            rms_norm_eps=getattr(config, 'rms_norm_eps', 1e-6),
+            use_cache=getattr(config, 'use_cache', True),
+            attention_bias=False,
+            pretraining_tp=1,
+        )
+        logger.debug(f"Converted {type(config).__name__} to LlamaConfig for OptimizedLlamaDecoderLayer compatibility")
+        return llama_config
+    except Exception as e:
+        logger.warning(f"Failed to convert config to LlamaConfig: {e}. Using original config.")
+        # Fallback: add missing attributes to original config
+        if not hasattr(config, 'attention_bias'):
+            config.attention_bias = False
+        if not hasattr(config, 'pretraining_tp'):
+            config.pretraining_tp = 1
+        return config
 
 
 def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
@@ -164,6 +262,13 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
     non_quantized_converted = 0
     already_optimized = 0
     
+    # Convert config to LlamaConfig for OptimizedLlamaDecoderLayer compatibility
+    # This ensures Qwen2Config and other LLaMA-compatible configs work properly
+    if OPT_AVAILABLE:
+        optimized_config = _convert_config_to_llama_config(config)
+    else:
+        optimized_config = config
+    
     for idx, layer in enumerate(raw_layers):
         if OPT_AVAILABLE:
             if isinstance(layer, OptimizedLlamaDecoderLayer):
@@ -171,12 +276,17 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                 already_optimized += 1
                 continue
             
-            if isinstance(layer, LlamaDecoderLayer):
+            # Support both LlamaDecoderLayer and Qwen2DecoderLayer (Qwen2.5 uses LLaMA-based architecture)
+            is_llama_layer = isinstance(layer, LlamaDecoderLayer)
+            is_qwen_layer = QWEN_AVAILABLE and isinstance(layer, Qwen2DecoderLayer)
+            
+            if is_llama_layer or is_qwen_layer:
                 if _has_quantized_layers(layer):
                     # For quantized layers, create OptimizedLlamaDecoderLayer and copy modules directly
                     # to avoid shape mismatch from load_state_dict
                     try:
-                        opt_layer = OptimizedLlamaDecoderLayer(config)
+                        # Use optimized_config (LlamaConfig) for OptimizedLlamaDecoderLayer
+                        opt_layer = OptimizedLlamaDecoderLayer(optimized_config)
                         orig_attn = layer.self_attn
                         opt_attn = opt_layer.self_attn
                         
@@ -217,7 +327,8 @@ def _convert_layers(raw_layers: nn.ModuleList, config) -> nn.ModuleList:
                         continue
                 else:
                     # Non-quantized: use standard conversion with load_state_dict
-                    opt_layer = OptimizedLlamaDecoderLayer(config)
+                    # Use optimized_config (LlamaConfig) for OptimizedLlamaDecoderLayer
+                    opt_layer = OptimizedLlamaDecoderLayer(optimized_config)
                     missing, unexpected = opt_layer.load_state_dict(layer.state_dict(), strict=False)
                     if missing or unexpected:
                         logger.warning(
@@ -264,40 +375,55 @@ def _from_cache(present):
 
 
 class Stage0(nn.Module):
-    """LLaMA-only Stage0; keep Cache end-to-end (no manual recompute)."""
+    """Stage0 for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end (no manual recompute)."""
 
     def __init__(self, full, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in Stage0.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
+        # LLaMA-style models (LLaMA, Mistral, Mixtral, Qwen)
         if hasattr(full, "model") and hasattr(full.model, "embed_tokens"):
             self.embed_tokens = full.model.embed_tokens
+            self.pos_embed = None  # LLaMA uses RoPE, no positional embeddings
             raw_layers = full.model.layers  # already pruned in load_stage_model
+        # GPT-style models (BLOOM, GPT-2, etc.)
         elif hasattr(full, "transformer") and hasattr(full.transformer, "wte"):
             self.embed_tokens = full.transformer.wte
-            self.pos_embed = getattr(full.transformer, "wpe", None)
+            self.pos_embed = getattr(full.transformer, "wpe", None)  # Positional embeddings for GPT-style
             raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.embed_tokens) or GPT-style (transformer.wte)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        # For LLaMA-style models, try to use OptimizedLlamaDecoderLayer if available
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            # BLOOM/GPT models: use original layers without optimization
+            self.layers = nn.ModuleList(raw_layers)
+            logger.info(f"Stage0 initialized with {len(self.layers)} layers (end={end}) for GPT-style model (BLOOM/GPT)")
+        else:
+            # LLaMA-style models: try to convert to OptimizedLlamaDecoderLayer
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
         
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
-        else:
-            logger.info(
-                f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
-                f"{quantized_layers} quantized"
-            )
+        # Log layer status (only for LLaMA-style models)
+        if not is_gpt_style:
+            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                logger.info(
+                    f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                )
+            else:
+                logger.info(
+                    f"Stage0 initialized with {len(self.layers)} layers (end={end}): "
+                    f"{quantized_layers} quantized"
+                )
 
     def forward(
         self,
@@ -308,24 +434,40 @@ class Stage0(nn.Module):
         use_cache: bool = True,
     ):
         x = self.embed_tokens(input_ids)
+        # Add positional embeddings for GPT-style models (BLOOM, GPT-2)
+        if self.pos_embed is not None:
+            if position_ids is None:
+                # Generate position_ids if not provided
+                seq_length = input_ids.shape[1]
+                position_ids = torch.arange(seq_length, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+            x = x + self.pos_embed(position_ids)
         cache_obj = None
         tuple_cache = []
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -369,38 +511,50 @@ class Stage0(nn.Module):
 
 
 class StageSegment(nn.Module):
-    """LLaMA-only middle segment; keep Cache end-to-end."""
+    """Middle segment for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end."""
 
     def __init__(self, full, start: int, end: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageSegment.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
         elif hasattr(full, "transformer") and hasattr(full.transformer, "h"):
             raw_layers = full.transformer.h  # already pruned in load_stage_model
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.layers) or GPT-style (transformer.h)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            self.layers = nn.ModuleList(raw_layers)
+        else:
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.config = full.config
         if len(self.layers) == 0:
             logger.warning(f"StageSegment initialized with 0 layers (start={start}, end={end})")
         else:
-            # Log layer status
-            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-                logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-                )
+            # Log layer status (only for LLaMA-style models)
+            if not is_gpt_style:
+                quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+                if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                    optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                    logger.info(
+                        f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                        f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                    )
+                else:
+                    logger.info(
+                        f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
+                        f"{quantized_layers} quantized"
+                    )
             else:
                 logger.info(
-                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}): "
-                    f"{quantized_layers} quantized"
+                    f"StageSegment initialized with {len(self.layers)} layers (start={start}, end={end}) for GPT-style model (BLOOM/GPT)"
                 )
 
     def forward(
@@ -416,19 +570,28 @@ class StageSegment(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
@@ -466,13 +629,15 @@ class StageSegment(nn.Module):
 
 
 class StageLast(nn.Module):
-    """LLaMA-only last stage; keep Cache end-to-end."""
+    """Last stage for LLaMA-style and GPT-style (BLOOM) models; keep Cache end-to-end."""
 
     def __init__(self, full, start: int):
         super().__init__()
         model_type = getattr(full.config, "model_type", "").lower()
-        if "llama" not in model_type and "mistral" not in model_type and "mixtral" not in model_type:
-            raise ValueError("Only LLaMA-style models are supported in StageLast.")
+        is_llama_style = "llama" in model_type or "mistral" in model_type or "mixtral" in model_type or "qwen" in model_type
+        is_gpt_style = "bloom" in model_type or "gpt" in model_type
+        if not is_llama_style and not is_gpt_style:
+            raise ValueError(f"Unsupported model type: {model_type}. Supported: LLaMA-style (llama, mistral, mixtral, qwen) or GPT-style (bloom, gpt)")
 
         if hasattr(full, "model") and hasattr(full.model, "layers"):
             raw_layers = full.model.layers  # already pruned in load_stage_model
@@ -486,24 +651,34 @@ class StageLast(nn.Module):
             raw_layers = full.transformer.h  # already pruned in load_stage_model
             self.norm = full.transformer.ln_f
         else:
-            raise ValueError(f"Unsupported LLaMA architecture: {type(full)}.")
+            raise ValueError(f"Unsupported model architecture: {type(full)}. Expected LLaMA-style (model.layers) or GPT-style (transformer.h)")
 
-        self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
+        # For BLOOM/GPT models, don't use OptimizedLlamaDecoderLayer (incompatible architecture)
+        self.is_gpt_style = is_gpt_style  # Store for use in forward method
+        if is_gpt_style:
+            self.layers = nn.ModuleList(raw_layers)
+        else:
+            self.layers = _convert_layers(nn.ModuleList(raw_layers), full.config)
         self.lm_head = full.lm_head
         self.config = full.config
         
-        # Log layer status
-        quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
-        if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
-            optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
-            logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
-            )
+        # Log layer status (only for LLaMA-style models)
+        if not is_gpt_style:
+            quantized_layers = sum(1 for layer in self.layers if _has_quantized_layers(layer))
+            if OPT_AVAILABLE and OptimizedLlamaDecoderLayer is not None:
+                optimized_layers = sum(1 for layer in self.layers if isinstance(layer, OptimizedLlamaDecoderLayer))
+                logger.info(
+                    f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                    f"{quantized_layers} quantized, {optimized_layers} OptimizedLlamaDecoderLayer"
+                )
+            else:
+                logger.info(
+                    f"StageLast initialized with {len(self.layers)} layers (start={start}): "
+                    f"{quantized_layers} quantized"
+                )
         else:
             logger.info(
-                f"StageLast initialized with {len(self.layers)} layers (start={start}): "
-                f"{quantized_layers} quantized"
+                f"StageLast initialized with {len(self.layers)} layers (start={start}) for GPT-style model (BLOOM/GPT)"
             )
 
     def forward(
@@ -519,19 +694,28 @@ class StageLast(nn.Module):
 
         for i, layer in enumerate(self.layers):
             layer_past = None if past_key_values is None else past_key_values[i]
-            layer_pos = position_ids if position_ids is not None else default_position_ids(
-                layer_past, x.shape[1], x.device
-            )
-            # Use standard layer forward
-            # OptimizedLlamaDecoderLayer (including quantized ones) properly returns KV cache
-            out = layer(
-                x,
-                attention_mask=None,
-                position_ids=layer_pos,
-                past_key_value=_to_cache(layer_past),
-                use_cache=use_cache,
-                output_attentions=False,
-            )
+            # BLOOM/GPT models don't use position_ids, LLaMA-style models do
+            if self.is_gpt_style:
+                # BLOOM/GPT models: use layer_past format, no position_ids
+                out = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    layer_past=_to_cache(layer_past),
+                    use_cache=use_cache,
+                )
+            else:
+                # LLaMA-style models: use position_ids and past_key_value
+                layer_pos = position_ids if position_ids is not None else default_position_ids(
+                    layer_past, x.shape[1], x.device
+                )
+                out = layer(
+                    x,
+                    attention_mask=None,
+                    position_ids=layer_pos,
+                    past_key_value=_to_cache(layer_past),
+                    use_cache=use_cache,
+                    output_attentions=False,
+                )
             
             # Validate output structure
             if not isinstance(out, (tuple, list)) or len(out) == 0:
