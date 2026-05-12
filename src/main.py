@@ -17,7 +17,13 @@ try:
     from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
-    from .inference_metrics import throughput_segments_from_decode
+    from .inference_metrics import (
+        aggregate_trial_metrics,
+        build_baseline_comparison,
+        decode_step_latency_recovery_stretch,
+        recovery_latency_summary,
+        throughput_segments_from_decode,
+    )
 except ImportError:
     import sys
     from pathlib import Path
@@ -26,7 +32,13 @@ except ImportError:
     from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
-    from src.inference_metrics import throughput_segments_from_decode
+    from src.inference_metrics import (
+        aggregate_trial_metrics,
+        build_baseline_comparison,
+        decode_step_latency_recovery_stretch,
+        recovery_latency_summary,
+        throughput_segments_from_decode,
+    )
 
 logger = get_logger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -112,158 +124,273 @@ def run_rank0(args, device, splits):
         except Exception:
             total_blocks = 32
 
-    tx = RpcTransport(
-        device=device,
-        stage=0,
-        dht_initial_peers=dht_peers,
-        dht_port=args.dht_port,
-        rpc_port=args.rpc_port,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
-        # ✅ Full LB
-        routing=("module" if args.use_load_balancing else "stage"),
-        model_name=args.model,
-        total_blocks=total_blocks,
-        start_block=stage0_end,
-        fault_tolerance=not getattr(args, "no_fault_tolerance", False),
-        enable_metrics=not getattr(args, "no_metrics", False),
-    )
+    try:
+        from .utils import normalize_cache
+    except ImportError:
+        from src.utils import normalize_cache
 
-    prompt = args.prompt
-    input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
-    L = input_ids.size(1)
+    n_trials = max(1, int(getattr(args, "failover_trials", 1) or 1))
 
-    attn, pos = None, torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)
+    def _run_rank0_single_session(trial_index: int) -> dict:
+        tx = None
+        try:
+            tx = RpcTransport(
+                device=device,
+                stage=0,
+                dht_initial_peers=dht_peers,
+                dht_port=args.dht_port,
+                rpc_port=args.rpc_port,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                stage_keys=[f"mini_petals:stage{i}" for i in range(1, 4)],
+                routing=("module" if args.use_load_balancing else "stage"),
+                model_name=args.model,
+                total_blocks=total_blocks,
+                start_block=stage0_end,
+                fault_tolerance=not getattr(args, "no_fault_tolerance", False),
+                enable_metrics=not getattr(args, "no_metrics", False),
+            )
 
-    past0 = None
-    prompt_ids = input_ids.clone()
+            prompt = args.prompt
+            input_ids = tok(prompt, return_tensors="pt").input_ids.to(device)
+            L = input_ids.size(1)
 
-    t_prefill_start = time.perf_counter()
-    from src.utils import normalize_cache
+            attn, pos = None, torch.arange(L, device=device, dtype=torch.long).unsqueeze(0)
 
-    hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)
-    past0 = normalize_cache(past0)
+            past0 = None
+            prompt_ids = input_ids.clone()
 
-    session_id = str(uuid4())
-    max_length = L + args.max_new_tokens
+            t_prefill_start = time.perf_counter()
 
-    tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)
-    next_id = tx.recv_token()
-    generated = [next_id]
-    t_prefill_end = time.perf_counter()
-    prefill_time = t_prefill_end - t_prefill_start
-
-    # 토큰 간격(stall / throughput 구간): 직전 토큰 수신 시각 ~ 이번 토큰 수신 시각
-    t_after_last_token_wall = time.perf_counter()
-    decode_token_to_token_intervals_s: list[float] = []
-    had_recovery_per_decode_step: list[bool] = []
-
-    logger.info(f"Prefill completed in {prefill_time:.3f}s")
-    logger.info(f"Generated token: {next_id} ({tok.decode([next_id], skip_special_tokens=True)})")
-
-    cur_len = L + 1
-    t_decode_start = time.perf_counter()
-    eos_token_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
-
-    consecutive_repeat_count = 0
-    last_token = None
-    decode_total_times = []
-
-    for _ in range(args.max_new_tokens - 1):
-        need_full_recompute = (past0 is None) or (isinstance(past0, (list, tuple)) and len(past0) == 0)
-
-        if need_full_recompute:
-            logger.warning("Stage0 cache missing; recomputing from full history.")
-            full_input = torch.cat([prompt_ids, torch.tensor([generated], device=device, dtype=torch.long)], dim=1)
-            full_pos = torch.arange(full_input.shape[1], device=device, dtype=torch.long).unsqueeze(0)
-            attn = None
-            hidden_full, past0 = s0(full_input, full_pos, attn, None, use_cache=True)
-            past0 = normalize_cache(past0)
-            hidden = hidden_full[:, -1:, :]
-        else:
-            new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
-            if isinstance(past0, (list, tuple)) and isinstance(past0[0], (list, tuple)) and past0[0][0] is not None:
-                past_len = past0[0][0].shape[-2]
-            elif Cache is not None and isinstance(past0, Cache):
-                past_len = past0.get_seq_length(0)
-            else:
-                past_len = cur_len - 1
-                logger.warning(f"Stage0 past tuple missing first entry, fallback past_len={past_len}, past summary: {_describe_past(past0)}")
-
-            attn = None
-            pos = torch.tensor([[past_len]], device=device, dtype=torch.long)
-            hidden, past0 = s0(new_input, pos, attn, past0, use_cache=True)
+            hidden, past0 = s0(input_ids, pos, attn, past0, use_cache=True)
             past0 = normalize_cache(past0)
 
-        tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)
-        next_id = tx.recv_token()
-        t_now_wall = time.perf_counter()
-        decode_token_to_token_intervals_s.append(t_now_wall - t_after_last_token_wall)
-        had_recovery_per_decode_step.append(bool(getattr(tx, "last_decode_had_recovery", False)))
-        t_after_last_token_wall = t_now_wall
+            session_id = str(uuid4())
+            max_length = L + args.max_new_tokens
 
-        if eos_token_id is not None and next_id == eos_token_id:
-            logger.info("EOS token generated, stopping generation")
-            break
+            tx.send_prefill(L, hidden, session_id=session_id, max_length=max_length)
+            next_id = tx.recv_token()
+            generated = [next_id]
+            t_prefill_end = time.perf_counter()
+            prefill_time = t_prefill_end - t_prefill_start
 
-        if next_id == last_token:
-            consecutive_repeat_count += 1
-            if consecutive_repeat_count >= 5:
-                next_token_text = tok.decode([next_id], skip_special_tokens=True)
-                logger.warning(f"Consecutive repetition detected (token {next_id}='{next_token_text}'), stopping generation")
-                break
-        else:
+            t_after_last_token_wall = time.perf_counter()
+            decode_token_to_token_intervals_s: list[float] = []
+            had_recovery_per_decode_step: list[bool] = []
+
+            logger.info(f"Prefill completed in {prefill_time:.3f}s")
+            logger.info(f"Generated token: {next_id} ({tok.decode([next_id], skip_special_tokens=True)})")
+
+            cur_len = L + 1
+            t_decode_start = time.perf_counter()
+            eos_token_id = tok.eos_token_id if tok.eos_token_id is not None else tok.pad_token_id
+
             consecutive_repeat_count = 0
-            last_token = next_id
+            last_token = None
+            decode_total_times: list[float] = []
 
-        if tx.last_decode_total is not None:
-            decode_total_times.append(tx.last_decode_total)
+            for _ in range(args.max_new_tokens - 1):
+                need_full_recompute = (past0 is None) or (isinstance(past0, (list, tuple)) and len(past0) == 0)
 
-        generated.append(next_id)
-        cur_len += 1
+                if need_full_recompute:
+                    logger.warning("Stage0 cache missing; recomputing from full history.")
+                    full_input = torch.cat([prompt_ids, torch.tensor([generated], device=device, dtype=torch.long)], dim=1)
+                    full_pos = torch.arange(full_input.shape[1], device=device, dtype=torch.long).unsqueeze(0)
+                    attn = None
+                    hidden_full, past0 = s0(full_input, full_pos, attn, None, use_cache=True)
+                    past0 = normalize_cache(past0)
+                    hidden = hidden_full[:, -1:, :]
+                else:
+                    new_input = torch.tensor([[next_id]], device=device, dtype=torch.long)
+                    if isinstance(past0, (list, tuple)) and isinstance(past0[0], (list, tuple)) and past0[0][0] is not None:
+                        past_len = past0[0][0].shape[-2]
+                    elif Cache is not None and isinstance(past0, Cache):
+                        past_len = past0.get_seq_length(0)
+                    else:
+                        past_len = cur_len - 1
+                        logger.warning(
+                            f"Stage0 past tuple missing first entry, fallback past_len={past_len}, "
+                            f"past summary: {_describe_past(past0)}"
+                        )
 
-    t_decode_end = time.perf_counter()
-    decode_time = t_decode_end - t_decode_start
-    total_time = t_decode_end - t_prefill_start
+                    attn = None
+                    pos = torch.tensor([[past_len]], device=device, dtype=torch.long)
+                    hidden, past0 = s0(new_input, pos, attn, past0, use_cache=True)
+                    past0 = normalize_cache(past0)
 
-    generated_text = tok.decode(generated, skip_special_tokens=True)
-    print(f"\n{'='*80}")
-    print(f"PROMPT: {prompt}")
-    print(f"GENERATED: {generated_text}")
-    print(f"{'='*80}\n")
+                tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)
+                next_id = tx.recv_token()
+                t_now_wall = time.perf_counter()
+                decode_token_to_token_intervals_s.append(t_now_wall - t_after_last_token_wall)
+                had_recovery_per_decode_step.append(bool(getattr(tx, "last_decode_had_recovery", False)))
+                t_after_last_token_wall = t_now_wall
 
-    logger.info(f"\nDecode completed in {decode_time:.3f}s")
-    logger.info(f"Total time: {total_time:.3f}s")
-    logger.info(f"TTFT (Time to First Token): {prefill_time:.3f}s")
+                if eos_token_id is not None and next_id == eos_token_id:
+                    logger.info("EOS token generated, stopping generation")
+                    break
 
-    metrics_report: dict = {
-        "model": args.model,
-        "use_load_balancing": bool(getattr(args, "use_load_balancing", False)),
-        "fault_tolerance_enabled": not getattr(args, "no_fault_tolerance", False),
-        "metrics_enabled": not getattr(args, "no_metrics", False),
-        "prefill_time_s": round(prefill_time, 6),
-        "decode_time_s": round(decode_time, 6),
-        "total_time_s": round(total_time, 6),
-        "output_token_count": len(generated),
-        "end_to_end_tokens_per_s": round(len(generated) / total_time, 6) if total_time > 1e-9 else None,
-        "decode_only_tokens_per_s": round((len(generated) - 1) / decode_time, 6) if len(generated) > 1 and decode_time > 1e-9 else None,
-        "rpc_transport": tx.get_metrics_summary(),
-        "decode_token_to_token_wall": {
-            "intervals_s": [round(x, 6) for x in decode_token_to_token_intervals_s],
-            "had_recovery_per_step": had_recovery_per_decode_step,
-            "throughput_segments": throughput_segments_from_decode(
+                if next_id == last_token:
+                    consecutive_repeat_count += 1
+                    if consecutive_repeat_count >= 5:
+                        next_token_text = tok.decode([next_id], skip_special_tokens=True)
+                        logger.warning(
+                            f"Consecutive repetition detected (token {next_id}='{next_token_text}'), stopping generation"
+                        )
+                        break
+                else:
+                    consecutive_repeat_count = 0
+                    last_token = next_id
+
+                if tx.last_decode_total is not None:
+                    decode_total_times.append(tx.last_decode_total)
+
+                generated.append(next_id)
+                cur_len += 1
+
+            t_decode_end = time.perf_counter()
+            decode_time = t_decode_end - t_decode_start
+            total_time = t_decode_end - t_prefill_start
+
+            generated_text = tok.decode(generated, skip_special_tokens=True)
+            if n_trials == 1:
+                print(f"\n{'='*80}")
+                print(f"PROMPT: {prompt}")
+                print(f"GENERATED: {generated_text}")
+                print(f"{'='*80}\n")
+            else:
+                logger.info(f"Trial {trial_index + 1}/{n_trials} GENERATED ({len(generated)} tokens): {generated_text[:200]}...")
+
+            logger.info(f"\nDecode completed in {decode_time:.3f}s")
+            logger.info(f"Total time: {total_time:.3f}s")
+            logger.info(f"TTFT (Time to First Token): {prefill_time:.3f}s")
+
+            rpc_summary = tx.get_metrics_summary()
+            recovery_events = rpc_summary.get("recovery_events") or []
+            throughput_seg = throughput_segments_from_decode(
                 token_to_token_intervals_s=decode_token_to_token_intervals_s,
                 had_recovery_per_decode_step=had_recovery_per_decode_step,
-            ),
-        },
-        "per_decode_rpc_compute_latency_s": [round(x, 6) for x in decode_total_times],
-        "note_ft_overhead_ab": (
-            "FT overhead A/B: 동일 프롬프트·토큰 수로 한 번은 기본(FT on), "
-            "한 번은 --no_fault_tolerance 로 실행해 total_time_s / decode_only_tokens_per_s 를 비교하세요."
-        ),
-    }
+            )
+
+            metrics_report: dict = {
+                "model": args.model,
+                "use_load_balancing": bool(getattr(args, "use_load_balancing", False)),
+                "fault_tolerance_enabled": not getattr(args, "no_fault_tolerance", False),
+                "metrics_enabled": not getattr(args, "no_metrics", False),
+                "trial_index": trial_index,
+                "trial_completed": True,
+                "prefill_time_s": round(prefill_time, 6),
+                "decode_time_s": round(decode_time, 6),
+                "total_time_s": round(total_time, 6),
+                "end_to_end_latency_s": round(total_time, 6),
+                "output_token_count": len(generated),
+                "end_to_end_tokens_per_s": round(len(generated) / total_time, 6) if total_time > 1e-9 else None,
+                "decode_only_tokens_per_s": round((len(generated) - 1) / decode_time, 6)
+                if len(generated) > 1 and decode_time > 1e-9
+                else None,
+                "recovery_time_and_latency": {
+                    "recovery_events_aggregate_s": recovery_latency_summary(recovery_events),
+                    "last_prefill_recovery_latency_s": rpc_summary.get("last_prefill_recovery_latency_s"),
+                    "last_decode_recovery_latency_s": rpc_summary.get("last_decode_recovery_latency_s"),
+                    "last_prefill_had_recovery": rpc_summary.get("last_prefill_had_recovery"),
+                    "last_decode_had_recovery": rpc_summary.get("last_decode_had_recovery"),
+                    "note": (
+                        "recovery_latency_s 는 RPC 실패 시점부터 같은 스텝에서 재시도로 성공할 때까지입니다. "
+                        "디코드 스텝 전체 관점에서는 decode_step_recovery_vs_normal_latency 와 "
+                        "per_decode_rpc_compute_latency_s 를 함께 보세요."
+                    ),
+                },
+                "steady_state_and_post_failure_throughput": throughput_seg.get("steady_state_vs_post_failure"),
+                "decode_step_recovery_vs_normal_latency": decode_step_latency_recovery_stretch(
+                    per_decode_wall_time_s=decode_total_times,
+                    had_recovery_per_decode_step=had_recovery_per_decode_step,
+                ),
+                "load_distribution_fairness": rpc_summary.get("load_fairness"),
+                "rpc_transport": rpc_summary,
+                "decode_token_to_token_wall": {
+                    "intervals_s": [round(x, 6) for x in decode_token_to_token_intervals_s],
+                    "had_recovery_per_step": had_recovery_per_decode_step,
+                    "throughput_segments": throughput_seg,
+                },
+                "per_decode_rpc_compute_latency_s": [round(x, 6) for x in decode_total_times],
+                "average_per_decode_rpc_latency_s": round(sum(decode_total_times) / len(decode_total_times), 6)
+                if decode_total_times
+                else None,
+                "note_ft_overhead_ab": (
+                    "장애가 없을 때 FT 순수 오버헤드: --baseline_metrics_json 에 "
+                    "동일 조건의 --no_fault_tolerance 실행 결과를 넘기면 "
+                    "baseline_comparison.fault_tolerance_overhead 가 채워집니다."
+                ),
+                "note_lb_gain_baseline": (
+                    "LB 이득: 베이스라인 JSON(use_load_balancing=false) 경로를 "
+                    "--baseline_metrics_json 으로 넘기면 baseline_comparison.load_balancing_gain 이 채워집니다."
+                ),
+                "generated_text_preview": (generated_text[:800] + "…") if len(generated_text) > 800 else generated_text,
+            }
+            return metrics_report
+        except Exception as e:
+            logger.exception("Stage0 inference trial %s failed", trial_index)
+            return {
+                "model": args.model,
+                "use_load_balancing": bool(getattr(args, "use_load_balancing", False)),
+                "fault_tolerance_enabled": not getattr(args, "no_fault_tolerance", False),
+                "metrics_enabled": not getattr(args, "no_metrics", False),
+                "trial_index": trial_index,
+                "trial_completed": False,
+                "error": str(e),
+            }
+        finally:
+            if tx is not None:
+                try:
+                    tx.shutdown()
+                except Exception as ex:
+                    logger.warning("RpcTransport shutdown after trial: %s", ex)
+
+    trial_reports: list[dict] = []
+    for ti in range(n_trials):
+        logger.info("Inference trial %s/%s", ti + 1, n_trials)
+        trial_reports.append(_run_rank0_single_session(ti))
+
+    successes = [t for t in trial_reports if t.get("trial_completed") is True]
+    if not successes:
+        raise RuntimeError("모든 inference trial 이 실패했습니다. 로그의 error 필드를 확인하세요.")
+
+    metrics_report = dict(successes[-1])
+    agg = aggregate_trial_metrics(trial_reports)
+    metrics_report["failover_eval_trials"] = agg
+    metrics_report["each_trial_compact"] = [
+        {
+            "trial_index": t.get("trial_index"),
+            "trial_completed": t.get("trial_completed"),
+            "total_time_s": t.get("total_time_s"),
+            "recovery_event_count": (t.get("rpc_transport") or {}).get("recovery_event_count"),
+            "error": t.get("error"),
+        }
+        for t in trial_reports
+    ]
+    avg_e2e = agg.get("average_end_to_end_latency_s")
+    metrics_report["average_end_to_end_latency_s"] = avg_e2e
+    metrics_report["comparison_end_to_end_time_s"] = avg_e2e if avg_e2e is not None else metrics_report.get("total_time_s")
+
+    baseline_path = (getattr(args, "baseline_metrics_json", None) or "").strip()
+    if baseline_path:
+        try:
+            with open(baseline_path, encoding="utf-8") as bf:
+                baseline_obj = json.load(bf)
+            metrics_report["baseline_comparison"] = build_baseline_comparison(metrics_report, baseline_obj)
+        except Exception as e:
+            logger.warning("baseline_metrics_json 로드 실패 (%s): %s", baseline_path, e)
+            metrics_report["baseline_comparison"] = {"error": str(e), "path": baseline_path}
+
+    metrics_report["failover_success_rate"] = agg.get("failover_success_rate")
+
+    if n_trials > 1:
+        prev = successes[-1].get("generated_text_preview") or ""
+        print(
+            f"\n{'='*80}\n(multi-trial) 마지막 성공 trial_index={successes[-1].get('trial_index')} "
+            f"failover_success_rate={metrics_report.get('failover_success_rate')}\n"
+            f"generated_text_preview: {prev[:400]}{'…' if len(prev) > 400 else ''}\n{'='*80}\n"
+        )
 
     metrics_json = getattr(args, "metrics_json", None) or ""
     if metrics_json:
@@ -276,8 +403,6 @@ def run_rank0(args, device, splits):
     print("METRICS_SUMMARY (see also rpc_transport.recovery_events & load_fairness)")
     print(json.dumps(metrics_report, indent=2, ensure_ascii=False))
     print("=" * 80 + "\n")
-
-    tx.shutdown()
 
 
 @torch.inference_mode()
@@ -887,8 +1012,18 @@ def main():
         default="",
         help="실행 후 지표를 이 경로에 JSON으로 저장 (비우면 파일만 stdout 요약)",
     )
-
-    args = parser.parse_args()
+    parser.add_argument(
+        "--failover_trials",
+        type=int,
+        default=1,
+        help="동일 추론을 N회 연속 실행해 failover_success_rate 및 평균 E2E 지연을 집계 (강제 kill 실험 시 트라이얼 사이에 수동/스크립트로 kill)",
+    )
+    parser.add_argument(
+        "--baseline_metrics_json",
+        type=str,
+        default="",
+        help="비교용 베이스라인 metrics JSON (--no_fault_tolerance 또는 LB off 등 이전 실행 결과)",
+    )
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():

@@ -35,7 +35,7 @@ from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import split_for_streaming
 
 from .dht_utils import get_module_key
-from .inference_metrics import load_fairness_stats
+from .inference_metrics import load_fairness_stats, recovery_latency_summary
 
 if TYPE_CHECKING:
     from multiaddr import Multiaddr
@@ -779,6 +779,7 @@ class RpcTransport:
             "enable_metrics": self.enable_metrics,
             "recovery_events": list(self.recovery_events),
             "recovery_event_count": len(self.recovery_events),
+            "recovery_latency_aggregate_s": recovery_latency_summary(self.recovery_events),
             "peer_forward_counts": dict(self.peer_forward_counts),
             "load_fairness": fairness,
             "last_prefill_had_recovery": self.last_prefill_had_recovery,
