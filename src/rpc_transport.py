@@ -35,6 +35,7 @@ from hivemind.utils.logging import get_logger
 from hivemind.utils.streaming import split_for_streaming
 
 from .dht_utils import get_module_key
+from .inference_metrics import load_fairness_stats
 
 if TYPE_CHECKING:
     from multiaddr import Multiaddr
@@ -62,6 +63,8 @@ class RpcTransport:
         model_name: str = "default",
         total_blocks: Optional[int] = None,
         start_block: int = 0,
+        fault_tolerance: bool = True,
+        enable_metrics: bool = True,
     ):
         """
         Args:
@@ -77,6 +80,10 @@ class RpcTransport:
                 - "module": petals:module 기반 route 계산 후 호출
             model_name/total_blocks/start_block:
                 routing="module"에서 필수
+            fault_tolerance:
+                False면 클라이언트 캐시·replay·피어 재탐색 없이 첫 RPC 실패 시 즉시 예외 (오버헤드 A/B용).
+            enable_metrics:
+                False면 recovery/peer 카운터 등 계측을 건너뜀.
         """
         self.device = device
         self.stage = stage
@@ -89,6 +96,8 @@ class RpcTransport:
         self.model_name = model_name
         self.total_blocks = total_blocks
         self.start_block = start_block
+        self.fault_tolerance = bool(fault_tolerance)
+        self.enable_metrics = bool(enable_metrics)
 
         self.stage_keys = stage_keys or ["mini_petals:stage1", "mini_petals:stage2", "mini_petals:stage3"]
         self.sampling = {"temperature": float(temperature), "top_p": float(top_p), "top_k": int(top_k)}
@@ -110,6 +119,15 @@ class RpcTransport:
         # Full LB: session별 route 캐시
         self.session_routes: Dict[str, List[Tuple[str, bool]]] = {}  # session_id -> [(key, expect_hidden), ...]
 
+        # --- 벤치마크 계측 (recovery, 공정성 등) ---
+        self.peer_forward_counts: Dict[str, int] = {}
+        self.recovery_events: List[Dict[str, Any]] = []
+        self._current_step_recovery_latencies: List[float] = []
+        self.last_decode_had_recovery: bool = False
+        self.last_decode_recovery_latency_s: float = 0.0
+        self.last_prefill_had_recovery: bool = False
+        self.last_prefill_recovery_latency_s: float = 0.0
+
         initial_peers_list = self._format_initial_peers(dht_initial_peers)
 
         logger.info(f"Initializing DHT on {self.local_ip}:{dht_port}")
@@ -127,7 +145,10 @@ class RpcTransport:
         else:
             logger.info("Server stages do not rely on RpcTransport; only client helpers are active")
 
-        logger.info(f"RpcTransport initialized: stage={stage}, peer_id={self.peer_id}, routing={self.routing}")
+        logger.info(
+            f"RpcTransport initialized: stage={stage}, peer_id={self.peer_id}, routing={self.routing}, "
+            f"fault_tolerance={self.fault_tolerance}, enable_metrics={self.enable_metrics}"
+        )
 
     # ----------------------------
     # Small helpers (compat/safety)
@@ -500,6 +521,21 @@ class RpcTransport:
             self.session_routes[session_id] = await self._compute_module_route(session_id)
         return self.session_routes[session_id]
 
+    def _record_successful_forward(self, stage_key: str) -> None:
+        """성공한 원격 forward 1회당 peer 단위 카운트 (공정성 지표)."""
+        if not self.enable_metrics:
+            return
+        info = self.remote_info.get(stage_key) or {}
+        pid = info.get("peer_id")
+        if pid is None:
+            key = f"{stage_key}|unknown"
+        else:
+            try:
+                key = f"{stage_key}|{pid.to_base58()}"
+            except Exception:
+                key = f"{stage_key}|{str(pid)}"
+        self.peer_forward_counts[key] = int(self.peer_forward_counts.get(key, 0)) + 1
+
     # ----------------------------
     # RPC calls
     # ----------------------------
@@ -593,8 +629,10 @@ class RpcTransport:
         expect_hidden: bool,
         is_replay: bool = False,
         session_id: Optional[str] = None,
+        phase: str = "decode",
     ):
         max_recovery_attempts = 3
+        t_first_fail: Optional[float] = None
 
         for attempt in range(max_recovery_attempts):
             try:
@@ -613,15 +651,36 @@ class RpcTransport:
                     size = 0
 
                 forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
-                return await forward_fn(stage_key, serialized_tensors, metadata, timeout, expect_hidden)
+                out = await forward_fn(stage_key, serialized_tensors, metadata, timeout, expect_hidden)
+                if t_first_fail is not None and self.enable_metrics:
+                    dt = time.perf_counter() - t_first_fail
+                    self._current_step_recovery_latencies.append(dt)
+                    self.recovery_events.append(
+                        {
+                            "phase": phase,
+                            "stage_key": stage_key,
+                            "recovery_latency_s": round(dt, 6),
+                            "attempt_index": attempt,
+                        }
+                    )
+                    t_first_fail = None
+                self._record_successful_forward(stage_key)
+                return out
 
             except (asyncio.TimeoutError, ConnectionError, RuntimeError, ValueError, P2PDaemonError, P2PHandlerError) as e:
                 if is_replay:
                     logger.error(f"Replay failed for {stage_key}: {e}")
                     raise
 
+                if not self.fault_tolerance:
+                    logger.error(f"Stage {stage_key} failed with fault_tolerance disabled: {e}")
+                    raise
+
                 logger.warning(f"Stage {stage_key} failed (attempt {attempt + 1}/{max_recovery_attempts}): {e}")
                 self.failed_stages.add(stage_key)
+
+                if t_first_fail is None:
+                    t_first_fail = time.perf_counter()
 
                 # mark failed peer
                 if stage_key in self.remote_info:
@@ -646,7 +705,8 @@ class RpcTransport:
                     await self._connect_peer_if_possible(stage_key, new_peer_id, new_maddrs)
 
                     if (
-                        stage_key in self.client_cache
+                        self.fault_tolerance
+                        and stage_key in self.client_cache
                         and session_id is not None
                         and session_id in self.client_cache[stage_key]
                         and len(self.client_cache[stage_key][session_id]) > 0
@@ -710,6 +770,22 @@ class RpcTransport:
 
             forward_fn = self._call_stage_stream if size > MAX_UNARY_PAYLOAD_SIZE // 2 else self._call_stage_unary
             await forward_fn(stage_key, [serialized], replay_metadata, self.timeout, expect_hidden=True)
+            self._record_successful_forward(stage_key)
+
+    def get_metrics_summary(self) -> Dict[str, Any]:
+        fairness = load_fairness_stats(dict(self.peer_forward_counts))
+        return {
+            "fault_tolerance_enabled": self.fault_tolerance,
+            "enable_metrics": self.enable_metrics,
+            "recovery_events": list(self.recovery_events),
+            "recovery_event_count": len(self.recovery_events),
+            "peer_forward_counts": dict(self.peer_forward_counts),
+            "load_fairness": fairness,
+            "last_prefill_had_recovery": self.last_prefill_had_recovery,
+            "last_prefill_recovery_latency_s": self.last_prefill_recovery_latency_s,
+            "last_decode_had_recovery": self.last_decode_had_recovery,
+            "last_decode_recovery_latency_s": self.last_decode_recovery_latency_s,
+        }
 
     # ----------------------------
     # Public API: prefill / decode
@@ -720,54 +796,65 @@ class RpcTransport:
             raise RuntimeError("send_prefill should only be called by stage0")
 
         async def _send():
-            start_all = time.perf_counter()
-            hidden_cpu = hidden.cpu().detach()
-            metadata = MSGPackSerializer.dumps(
-                {
-                    "session_id": session_id,
-                    "seq_len": int(L),
-                    "cur_len": int(L),
-                    "is_prefill": True,
-                    "max_length": int(max_length),
-                    **self.sampling,
-                }
-            )
-
-            cur = hidden_cpu
-            stage_times: List[Tuple[str, float]] = []
-            route = await self._get_route(session_id)
-
-            for stage_key, expect_hidden in route:
-                self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
-
-                stage_start = time.perf_counter()
-                serialized = serialize_torch_tensor(cur)
-
-                result = await self._call_stage_with_recovery(
-                    stage_key,
-                    [serialized],
-                    metadata,
-                    self.timeout,
-                    expect_hidden=expect_hidden,
-                    is_replay=False,
-                    session_id=session_id,
+            self._current_step_recovery_latencies = []
+            try:
+                start_all = time.perf_counter()
+                hidden_cpu = hidden.cpu().detach()
+                metadata = MSGPackSerializer.dumps(
+                    {
+                        "session_id": session_id,
+                        "seq_len": int(L),
+                        "cur_len": int(L),
+                        "is_prefill": True,
+                        "max_length": int(max_length),
+                        **self.sampling,
+                    }
                 )
 
-                info = self.remote_info.get(stage_key, {})
-                maddrs = info.get("maddrs") or []
-                logger.info(f"Prefill pass: key={stage_key}, maddrs={maddrs}")
+                cur = hidden_cpu
+                stage_times: List[Tuple[str, float]] = []
+                route = await self._get_route(session_id)
 
-                stage_times.append((stage_key, time.perf_counter() - stage_start))
-                if expect_hidden:
-                    cur = result
+                for stage_key, expect_hidden in route:
+                    if self.fault_tolerance:
+                        self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
+
+                    stage_start = time.perf_counter()
+                    serialized = serialize_torch_tensor(cur)
+
+                    result = await self._call_stage_with_recovery(
+                        stage_key,
+                        [serialized],
+                        metadata,
+                        self.timeout,
+                        expect_hidden=expect_hidden,
+                        is_replay=False,
+                        session_id=session_id,
+                        phase="prefill",
+                    )
+
+                    info = self.remote_info.get(stage_key, {})
+                    maddrs = info.get("maddrs") or []
+                    logger.info(f"Prefill pass: key={stage_key}, maddrs={maddrs}")
+
+                    stage_times.append((stage_key, time.perf_counter() - stage_start))
+                    if expect_hidden:
+                        cur = result
+                    else:
+                        self.last_prefill_stage_times = stage_times
+                        self.last_prefill_total = time.perf_counter() - start_all
+                        return result
+
+                self.last_prefill_stage_times = stage_times
+                self.last_prefill_total = time.perf_counter() - start_all
+                raise RuntimeError("No final stage returned a token")
+            finally:
+                if self._current_step_recovery_latencies:
+                    self.last_prefill_had_recovery = True
+                    self.last_prefill_recovery_latency_s = float(sum(self._current_step_recovery_latencies))
                 else:
-                    self.last_prefill_stage_times = stage_times
-                    self.last_prefill_total = time.perf_counter() - start_all
-                    return result
-
-            self.last_prefill_stage_times = stage_times
-            self.last_prefill_total = time.perf_counter() - start_all
-            raise RuntimeError("No final stage returned a token")
+                    self.last_prefill_had_recovery = False
+                    self.last_prefill_recovery_latency_s = 0.0
 
         self._last_token = self._run_async(_send())
 
@@ -783,61 +870,74 @@ class RpcTransport:
             raise RuntimeError("send_decode_step should only be called by stage0")
 
         async def _send():
-            start_all = time.perf_counter()
-            hidden_cpu = hidden.cpu().detach()
-            metadata = MSGPackSerializer.dumps(
-                {
-                    "session_id": session_id,
-                    "seq_len": 1,
-                    "cur_len": int(cur_len),
-                    "is_prefill": False,
-                    "max_length": int(max_length),
-                    "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),
-                    **self.sampling,
-                }
-            )
-
-            cur = hidden_cpu
-            stage_times: List[Tuple[str, float]] = []
-            route = await self._get_route(session_id)
-
-            for stage_key, expect_hidden in route:
-                self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
-
-                stage_start = time.perf_counter()
-                serialized = serialize_torch_tensor(cur)
-
-                result = await self._call_stage_with_recovery(
-                    stage_key,
-                    [serialized],
-                    metadata,
-                    self.timeout,
-                    expect_hidden=expect_hidden,
-                    is_replay=False,
-                    session_id=session_id,
+            self._current_step_recovery_latencies = []
+            self.last_decode_had_recovery = False
+            self.last_decode_recovery_latency_s = 0.0
+            try:
+                start_all = time.perf_counter()
+                hidden_cpu = hidden.cpu().detach()
+                metadata = MSGPackSerializer.dumps(
+                    {
+                        "session_id": session_id,
+                        "seq_len": 1,
+                        "cur_len": int(cur_len),
+                        "is_prefill": False,
+                        "max_length": int(max_length),
+                        "generated_tokens": (generated_tokens[-50:] if generated_tokens else []),
+                        **self.sampling,
+                    }
                 )
 
-                info = self.remote_info.get(stage_key, {})
-                maddrs = info.get("maddrs") or []
-                logger.info(f"Decode pass: key={stage_key}, maddrs={maddrs}")
+                cur = hidden_cpu
+                stage_times: List[Tuple[str, float]] = []
+                route = await self._get_route(session_id)
 
-                stage_times.append((stage_key, time.perf_counter() - stage_start))
-                if expect_hidden:
-                    cur = result
+                for stage_key, expect_hidden in route:
+                    if self.fault_tolerance:
+                        self.client_cache.setdefault(stage_key, {}).setdefault(session_id, []).append(cur.clone().cpu())
+
+                    stage_start = time.perf_counter()
+                    serialized = serialize_torch_tensor(cur)
+
+                    result = await self._call_stage_with_recovery(
+                        stage_key,
+                        [serialized],
+                        metadata,
+                        self.timeout,
+                        expect_hidden=expect_hidden,
+                        is_replay=False,
+                        session_id=session_id,
+                        phase="decode",
+                    )
+
+                    info = self.remote_info.get(stage_key, {})
+                    maddrs = info.get("maddrs") or []
+                    logger.info(f"Decode pass: key={stage_key}, maddrs={maddrs}")
+
+                    stage_times.append((stage_key, time.perf_counter() - stage_start))
+                    if expect_hidden:
+                        cur = result
+                    else:
+                        total = time.perf_counter() - start_all
+                        self.last_decode_stage_times = stage_times
+                        self.last_decode_total = total
+                        self.decode_stage_history.append(stage_times)
+                        self.decode_total_times.append(total)
+                        return result
+
+                total = time.perf_counter() - start_all
+                self.last_decode_stage_times = stage_times
+                self.last_decode_total = total
+                self.decode_stage_history.append(stage_times)
+                self.decode_total_times.append(total)
+                raise RuntimeError("No final stage returned a token")
+            finally:
+                if self._current_step_recovery_latencies:
+                    self.last_decode_had_recovery = True
+                    self.last_decode_recovery_latency_s = float(sum(self._current_step_recovery_latencies))
                 else:
-                    total = time.perf_counter() - start_all
-                    self.last_decode_stage_times = stage_times
-                    self.last_decode_total = total
-                    self.decode_stage_history.append(stage_times)
-                    self.decode_total_times.append(total)
-                    return result
-
-            total = time.perf_counter() - start_all
-            self.last_decode_stage_times = stage_times
-            self.last_decode_total = total
-            self.decode_stage_history.append(stage_times)
-            self.decode_total_times.append(total)
-            raise RuntimeError("No final stage returned a token")
+                    self.last_decode_had_recovery = False
+                    self.last_decode_recovery_latency_s = 0.0
 
         self._last_token = self._run_async(_send())
 

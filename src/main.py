@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import os
 from uuid import uuid4
 import time
@@ -16,6 +17,7 @@ try:
     from .llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from .rpc_transport import RpcTransport
     from .rpc_handler import StageConnectionHandler
+    from .inference_metrics import throughput_segments_from_decode
 except ImportError:
     import sys
     from pathlib import Path
@@ -24,6 +26,7 @@ except ImportError:
     from src.llama_partition import load_stage_model, Stage0, StageSegment, StageLast
     from src.rpc_transport import RpcTransport
     from src.rpc_handler import StageConnectionHandler
+    from src.inference_metrics import throughput_segments_from_decode
 
 logger = get_logger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -124,6 +127,8 @@ def run_rank0(args, device, splits):
         model_name=args.model,
         total_blocks=total_blocks,
         start_block=stage0_end,
+        fault_tolerance=not getattr(args, "no_fault_tolerance", False),
+        enable_metrics=not getattr(args, "no_metrics", False),
     )
 
     prompt = args.prompt
@@ -149,6 +154,11 @@ def run_rank0(args, device, splits):
     generated = [next_id]
     t_prefill_end = time.perf_counter()
     prefill_time = t_prefill_end - t_prefill_start
+
+    # 토큰 간격(stall / throughput 구간): 직전 토큰 수신 시각 ~ 이번 토큰 수신 시각
+    t_after_last_token_wall = time.perf_counter()
+    decode_token_to_token_intervals_s: list[float] = []
+    had_recovery_per_decode_step: list[bool] = []
 
     logger.info(f"Prefill completed in {prefill_time:.3f}s")
     logger.info(f"Generated token: {next_id} ({tok.decode([next_id], skip_special_tokens=True)})")
@@ -189,6 +199,10 @@ def run_rank0(args, device, splits):
 
         tx.send_decode_step(cur_len, hidden, session_id=session_id, max_length=max_length, generated_tokens=generated)
         next_id = tx.recv_token()
+        t_now_wall = time.perf_counter()
+        decode_token_to_token_intervals_s.append(t_now_wall - t_after_last_token_wall)
+        had_recovery_per_decode_step.append(bool(getattr(tx, "last_decode_had_recovery", False)))
+        t_after_last_token_wall = t_now_wall
 
         if eos_token_id is not None and next_id == eos_token_id:
             logger.info("EOS token generated, stopping generation")
@@ -223,6 +237,45 @@ def run_rank0(args, device, splits):
     logger.info(f"\nDecode completed in {decode_time:.3f}s")
     logger.info(f"Total time: {total_time:.3f}s")
     logger.info(f"TTFT (Time to First Token): {prefill_time:.3f}s")
+
+    metrics_report: dict = {
+        "model": args.model,
+        "use_load_balancing": bool(getattr(args, "use_load_balancing", False)),
+        "fault_tolerance_enabled": not getattr(args, "no_fault_tolerance", False),
+        "metrics_enabled": not getattr(args, "no_metrics", False),
+        "prefill_time_s": round(prefill_time, 6),
+        "decode_time_s": round(decode_time, 6),
+        "total_time_s": round(total_time, 6),
+        "output_token_count": len(generated),
+        "end_to_end_tokens_per_s": round(len(generated) / total_time, 6) if total_time > 1e-9 else None,
+        "decode_only_tokens_per_s": round((len(generated) - 1) / decode_time, 6) if len(generated) > 1 and decode_time > 1e-9 else None,
+        "rpc_transport": tx.get_metrics_summary(),
+        "decode_token_to_token_wall": {
+            "intervals_s": [round(x, 6) for x in decode_token_to_token_intervals_s],
+            "had_recovery_per_step": had_recovery_per_decode_step,
+            "throughput_segments": throughput_segments_from_decode(
+                token_to_token_intervals_s=decode_token_to_token_intervals_s,
+                had_recovery_per_decode_step=had_recovery_per_decode_step,
+            ),
+        },
+        "per_decode_rpc_compute_latency_s": [round(x, 6) for x in decode_total_times],
+        "note_ft_overhead_ab": (
+            "FT overhead A/B: 동일 프롬프트·토큰 수로 한 번은 기본(FT on), "
+            "한 번은 --no_fault_tolerance 로 실행해 total_time_s / decode_only_tokens_per_s 를 비교하세요."
+        ),
+    }
+
+    metrics_json = getattr(args, "metrics_json", None) or ""
+    if metrics_json:
+        out_path = metrics_json.strip()
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(metrics_report, f, indent=2, ensure_ascii=False)
+        logger.info(f"Wrote metrics JSON to {out_path}")
+
+    print("\n" + "=" * 80)
+    print("METRICS_SUMMARY (see also rpc_transport.recovery_events & load_fairness)")
+    print(json.dumps(metrics_report, indent=2, ensure_ascii=False))
+    print("=" * 80 + "\n")
 
     tx.shutdown()
 
@@ -817,6 +870,23 @@ def main():
                         help="Mean period for balance check in seconds (default: 120)")
     parser.add_argument("--network_bandwidth_mbps", type=float, default=None,
                         help="Network bandwidth in Mbps for throughput estimation (default: auto estimate)")
+
+    parser.add_argument(
+        "--no_fault_tolerance",
+        action="store_true",
+        help="FT 비활성: 클라이언트 캐시·replay·피어 재탐색 없이 첫 RPC 실패 시 중단 (오버헤드 A/B 베이스라인)",
+    )
+    parser.add_argument(
+        "--no_metrics",
+        action="store_true",
+        help="recovery/peer 카운터 등 RpcTransport 계측 비활성화 (미세 벤치마크용)",
+    )
+    parser.add_argument(
+        "--metrics_json",
+        type=str,
+        default="",
+        help="실행 후 지표를 이 경로에 JSON으로 저장 (비우면 파일만 stdout 요약)",
+    )
 
     args = parser.parse_args()
 
