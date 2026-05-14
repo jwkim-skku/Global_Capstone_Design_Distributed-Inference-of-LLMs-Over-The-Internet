@@ -1025,6 +1025,8 @@ def main():
         help="비교용 베이스라인 metrics JSON (--no_fault_tolerance 또는 LB off 등 이전 실행 결과)",
     )
 
+    args = parser.parse_args()
+
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
