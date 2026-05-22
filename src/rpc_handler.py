@@ -140,9 +140,9 @@ class StageConnectionHandler(ConnectionHandler):
             pos_ids = torch.arange(seq_len, device=self.device, dtype=torch.long).unsqueeze(0)
         else:
             attn_mask = None
-            # Decode: 새 토큰의 position ID는 past_len부터 시작
-            # hidden_states.shape[1]은 항상 1 (decode 단계에서는 1개 토큰씩 처리)
-            new_token_pos = past_len
+            # Decode: position must match client cur_len (not raw KV length; KV can be +1 off).
+            chunk_len = int(hidden_states.shape[1])
+            new_token_pos = int(cur_len) - chunk_len
             pos_ids = torch.tensor([[new_token_pos]], device=self.device, dtype=torch.long)
         return attn_mask, pos_ids
 
@@ -371,7 +371,18 @@ class StageConnectionHandler(ConnectionHandler):
                         else:
                             logits[0, repeated_token] *= strong_penalty
         
+        last_logits = logits[:, -1, :] if logits.dim() == 3 else logits
+        if not torch.isfinite(last_logits).all():
+            logger.warning(
+                "Non-finite logits before sampling; using nan_to_num + greedy fallback path"
+            )
+            last_logits = torch.nan_to_num(last_logits, nan=-1e4, posinf=1e4, neginf=-1e4)
+            logits = last_logits if logits.dim() == 2 else last_logits.unsqueeze(1)
+
         probs = torch.softmax(logits / temp, dim=-1)
+        if not torch.isfinite(probs).all() or (probs < 0).any():
+            logger.warning("Invalid probability tensor; falling back to greedy argmax")
+            return int(torch.argmax(logits, dim=-1).item())
 
         if top_k > 0 and top_k < probs.size(-1):
             topk_probs, topk_idx = torch.topk(probs, top_k, dim=-1)
