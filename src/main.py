@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import gc
 import json
 import os
 from uuid import uuid4
@@ -105,8 +106,23 @@ def run_rank0(args, device, splits):
     #    나머지 블록(splits[0]..total_blocks-1)을 petals:module 라우팅으로 처리
     stage0_end = splits[0]  # ✅ LB여도 Stage0는 첫 구간(splits[0])까지 로컬로 계산
 
-    full = load_stage_model(args.model, device, role="stage0", end=stage0_end, dtype=args.dtype)
-    s0 = Stage0(full, stage0_end).to(device)
+    # Stage0 builds OptimizedLlamaDecoderLayer copies; keep `full` on CPU and drop it
+    # before .to(device) to avoid holding two weight sets on GPU (~70B OOM on ~95GB cards).
+    use_cpu_offload = getattr(args, "use_cpu_offload", False)
+    full = load_stage_model(
+        args.model,
+        device,
+        role="stage0",
+        end=stage0_end,
+        dtype=args.dtype,
+        use_cpu_offload=use_cpu_offload,
+    )
+    s0 = Stage0(full, stage0_end)
+    del full
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    s0 = s0.to(device)
 
     dht_peers = _format_initial_peers(args.dht_initial_peers)
 
@@ -519,6 +535,25 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
     balance_quality = getattr(args, 'balance_quality', 0.75)
     mean_balance_check_period = getattr(args, 'mean_balance_check_period', 120.0)
 
+    lb_fixed_start = getattr(args, "lb_fixed_block_start", None)
+    lb_fixed_end = getattr(args, "lb_fixed_block_end", None)
+    lb_fixed_mode = lb_fixed_start is not None and lb_fixed_end is not None
+    if lb_fixed_mode:
+        if lb_fixed_start < lb_min_block or lb_fixed_end > total_blocks or lb_fixed_start >= lb_fixed_end:
+            logger.error(
+                "잘못된 --lb_fixed_block_start/--lb_fixed_block_end: "
+                "요구조건 splits[0]<=%s < %s <= total_blocks=%s",
+                lb_fixed_start,
+                lb_fixed_end,
+                total_blocks,
+            )
+            return
+        logger.info(
+            "LB 고정 블록 모드(중복 담당·FT용): [%s, %s) — 자동 재조정 비활성",
+            lb_fixed_start,
+            lb_fixed_end,
+        )
+
     while True:
         try:
             module_infos = []
@@ -536,7 +571,10 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
                 time.sleep(retry_delay)
                 retry_delay *= 1.5
 
-            if len(module_infos) == 0:
+            if lb_fixed_mode:
+                block_indices = list(range(lb_fixed_start, lb_fixed_end))
+                logger.info(f"LB 고정 구간 사용: block_indices={block_indices}")
+            elif len(module_infos) == 0:
                 start = lb_min_block
                 end = min(lb_min_block + num_blocks, total_blocks)
                 block_indices = list(range(start, end))
@@ -583,7 +621,8 @@ def run_stage_server_with_load_balancing(args, device, splits, num_blocks, total
             should_rebalance = _setup_and_run_server_with_rebalancing(
                 args, device, stage_model, final_stage, dht,
                 block_indices, throughput, balance_quality, mean_balance_check_period,
-                args.model, total_blocks, lb_min_block
+                args.model, total_blocks, lb_min_block,
+                disable_rebalance=lb_fixed_mode,
             )
 
             if not should_rebalance:
@@ -746,6 +785,7 @@ def _setup_and_run_server_with_rebalancing(
     model_name,
     total_blocks,
     lb_min_block: int,
+    disable_rebalance: bool = False,
 ) -> bool:
     """
     Load Balancing 서버 실행 (주기적 재조정 포함)
@@ -919,7 +959,10 @@ def _setup_and_run_server_with_rebalancing(
                         logger.warning(f"Rebalance check failed: {e}")
                         await asyncio.sleep(10)
 
-            rebalance_task = asyncio.create_task(rebalance_check())
+            if disable_rebalance:
+                logger.info("LB 재조정(rebalance_check) 비활성: 고정 블록 구간 유지")
+            else:
+                rebalance_task = asyncio.create_task(rebalance_check())
 
             await handler.add_p2p_handlers(p2p)
             logger.info(f"Load Balancing server ready, blocks={block_indices}, throughput={current_throughput['value']:.2f} rps")
@@ -995,6 +1038,19 @@ def main():
                         help="Mean period for balance check in seconds (default: 120)")
     parser.add_argument("--network_bandwidth_mbps", type=float, default=None,
                         help="Network bandwidth in Mbps for throughput estimation (default: auto estimate)")
+    parser.add_argument(
+        "--lb_fixed_block_start",
+        type=int,
+        default=None,
+        help="LB 서버가 담당할 블록 시작 인덱스(포함). --lb_fixed_block_end와 함께 쓰면 "
+        "choose_best_blocks를 쓰지 않고 해당 구간만 로드·DHT 등록 (다른 노드와 동일 구간으로 FT 중복 담당).",
+    )
+    parser.add_argument(
+        "--lb_fixed_block_end",
+        type=int,
+        default=None,
+        help="LB 서버가 담당할 블록 끝(배제, Python range와 동일). 예: 8~15층이면 start=8 end=16.",
+    )
 
     parser.add_argument(
         "--no_fault_tolerance",
@@ -1039,6 +1095,9 @@ def main():
     args.dtype = dtype_map[args.dtype]
 
     splits = parse_splits(args.splits)
+    fs, fe = getattr(args, "lb_fixed_block_start", None), getattr(args, "lb_fixed_block_end", None)
+    if (fs is None) ^ (fe is None):
+        parser.error("--lb_fixed_block_start 와 --lb_fixed_block_end 는 둘 다 지정하거나 둘 다 생략해야 합니다.")
     if args.stage == 0:
         run_rank0(args, device, splits)
     else:
